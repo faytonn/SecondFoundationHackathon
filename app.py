@@ -3,8 +3,6 @@ from urllib.parse import urlparse, parse_qs
 from galacticbuffer import encode_message, decode_message
 import uuid
 import time
-import os
-import json
 
 USERS = {}
 TOKENS = {}
@@ -16,80 +14,6 @@ TRADES = []
 # New: balances + collateral
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
-
-# ---------- persistence setup ----------
-
-PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
-
-
-def _persistent_path(name: str):
-    """Return full path in PERSISTENT_DIR or None if not configured/usable."""
-    if not PERSISTENT_DIR:
-        return None
-    try:
-        os.makedirs(PERSISTENT_DIR, exist_ok=True)
-    except Exception:
-        return None
-    return os.path.join(PERSISTENT_DIR, name)
-
-
-def _load_json_default(path, default):
-    if not path or not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
-    except Exception:
-        return default
-
-
-def _save_json(path, data):
-    if not path:
-        return
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
-    except Exception:
-        # If saving fails, we just ignore; service still runs in-memory.
-        pass
-
-
-def load_persistent_state():
-    global USERS, TRADES, BALANCES, COLLATERAL
-
-    users_path = _persistent_path("users.json")
-    trades_path = _persistent_path("trades.json")
-    balances_path = _persistent_path("balances.json")
-    collateral_path = _persistent_path("collateral.json")
-
-    USERS = _load_json_default(users_path, {})
-    TRADES = _load_json_default(trades_path, [])
-    BALANCES = _load_json_default(balances_path, {})
-    COLLATERAL = _load_json_default(collateral_path, {})
-
-
-def save_users():
-    users_path = _persistent_path("users.json")
-    _save_json(users_path, USERS)
-
-
-def save_trades_and_balances():
-    trades_path = _persistent_path("trades.json")
-    balances_path = _persistent_path("balances.json")
-    _save_json(trades_path, TRADES)
-    _save_json(balances_path, BALANCES)
-
-
-def save_collateral():
-    collateral_path = _persistent_path("collateral.json")
-    _save_json(collateral_path, COLLATERAL)
-
-
-# Load persisted state when module is imported
-load_persistent_state()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -215,6 +139,10 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/balance":
             self.handle_get_balance()
 
+        elif parsed.path == "/v2/trades":
+            # NEW: public V2 trades endpoint
+            self.handle_v2_trades(parsed)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -284,7 +212,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
-        save_users()
         self._send_no_content(204)
 
     def handle_login(self):
@@ -341,7 +268,6 @@ class Handler(BaseHTTPRequestHandler):
             tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
-            save_users()
         except Exception:
             self._send_no_content(500)
             return
@@ -611,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
+                "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -638,9 +565,6 @@ class Handler(BaseHTTPRequestHandler):
             })
         else:
             status = "FILLED"
-
-        # Persist new trades + balances (and future ones)
-        save_trades_and_balances()
 
         self._send_gbuf(200, {
             "order_id": order_id,
@@ -784,6 +708,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
+                "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -799,9 +724,6 @@ class Handler(BaseHTTPRequestHandler):
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
-
-        # Persist trades + balances after modify trades
-        save_trades_and_balances()
 
         self._send_gbuf(200, {
             "order_id": order["order_id"],
@@ -975,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged, still global feed) ----------
+    # ---------- public trades (unchanged: global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -988,6 +910,54 @@ class Handler(BaseHTTPRequestHandler):
                 "seller_id": str(t["seller_id"]),
                 "price": int(t["price"]),
                 "quantity": int(t["quantity"]),
+                "timestamp": int(t["timestamp"]),
+            })
+
+        self._send_gbuf(200, {"trades": trades_payload})
+
+    # ---------- NEW: public V2-only trades for a contract ----------
+
+    def handle_v2_trades(self, parsed):
+        qs = parse_qs(parsed.query)
+        if "delivery_start" not in qs or "delivery_end" not in qs:
+            self._send_no_content(400)
+            return
+
+        try:
+            delivery_start = int(qs["delivery_start"][0])
+            delivery_end = int(qs["delivery_end"][0])
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            self._send_no_content(400)
+            return
+        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        # Filter only V2 trades for the given contract
+        v2_trades = [
+            t for t in TRADES
+            if t.get("source") == "v2"
+            and t.get("delivery_start") == delivery_start
+            and t.get("delivery_end") == delivery_end
+        ]
+
+        v2_trades.sort(key=lambda t: int(t["timestamp"]), reverse=True)
+
+        trades_payload = []
+        for t in v2_trades:
+            trades_payload.append({
+                "trade_id": str(t["trade_id"]),
+                "buyer_id": str(t["buyer_id"]),
+                "seller_id": str(t["seller_id"]),
+                "price": int(t["price"]),
+                "quantity": int(t["quantity"]),
+                "delivery_start": int(t["delivery_start"]),
+                "delivery_end": int(t["delivery_end"]),
                 "timestamp": int(t["timestamp"]),
             })
 
@@ -1037,11 +1007,11 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
+            "source": "v1",  # mark as V1 trade
         }
         TRADES.append(trade)
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
-        save_trades_and_balances()
 
         self._send_gbuf(200, {"trade_id": trade_id})
 
@@ -1080,7 +1050,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
-        save_collateral()
         self._send_no_content(204)
 
     def handle_get_balance(self):
