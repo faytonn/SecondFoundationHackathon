@@ -1,426 +1,588 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
 import struct
-import uuid
-import time
 
-def _u8(b, i):
-    return b[i], i+1
+TYPE_INT = 0x01
+TYPE_STRING = 0x02
+TYPE_LIST = 0x03
+TYPE_OBJECT = 0x04
+TYPE_BYTES = 0x05  # new in v2
 
-def _u16(b, i):
-    return struct.unpack_from(">H", b, i)[0], i+2
 
-def _u32(b, i):
-    return struct.unpack_from(">I", b, i)[0], i+4
+# ---------- ENCODING (v1 helpers – kept for completeness) ----------
 
-def _bs(b, i, n):
-    return b[i:i+n], i+n
+def _encode_int(value: int) -> bytes:
+    # 64-bit signed, big-endian
+    return struct.pack(">q", value)
 
-def _str_v1(b, i):
-    ln, i = _u16(b, i)
-    s, i = _bs(b, i, ln)
-    return s.decode(), i
 
-def _str_v2(b, i):
-    ln, i = _u32(b, i)
-    s, i = _bs(b, i, ln)
-    return s.decode(), i
+def _encode_string_v1(value: str) -> bytes:
+    data = value.encode("utf-8")
+    if len(data) > 0xFFFF:
+        raise ValueError("string too long for v1")
+    # 2-byte length
+    return struct.pack(">H", len(data)) + data
 
-def _field_v1(b, i):
-    k, i = _str_v1(b, i)
-    t, i = _u8(b, i)
-    if t == 1:
-        v, i = _str_v1(b, i)
-        return k, v, i
-    if t == 2:
-        n, i = _u16(b, i)
-        out = []
-        for _ in range(n):
-            s, i = _str_v1(b, i)
-            out.append(s)
-        return k, out, i
-    if t == 3:
-        v, i = _u32(b, i)
-        return k, v, i
-    if t == 4:
-        v, i = _u16(b, i)
-        return k, v, i
-    return k, None, i
 
-def _field_v2(b, i):
-    k, i = _str_v2(b, i)
-    t, i = _u8(b, i)
-    if t == 1:
-        v, i = _str_v2(b, i)
-        return k, v, i
-    if t == 2:
-        n, i = _u32(b, i)
-        out = []
-        for _ in range(n):
-            s, i = _str_v2(b, i)
-            out.append(s)
-        return k, out, i
-    if t == 3:
-        v, i = _u32(b, i)
-        return k, v, i
-    if t == 4:
-        v, i = _u16(b, i)
-        return k, v, i
-    if t == 5:
-        ln, i = _u32(b, i)
-        v, i = _bs(b, i, ln)
-        return k, v, i
-    return k, None, i
+def _encode_object_v1(obj: dict) -> bytes:
+    """
+    Encodes an object (type 0x04 value) in v1:
+    [field_count][field1][field2]...[fieldN]
+    Fields use the same [name_len][name][type][value] format as top-level.
+    Only ints and strings inside objects are supported here (as before).
+    """
+    field_bytes = bytearray()
+    field_count = 0
 
-def decode_message(b):
-    if b[0] == 1:
-        return decode_v1(b)
-    return decode_v2(b)
+    for name, value in obj.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length in object")
 
-def decode_v1(b):
-    i = 0
-    _, i = _u8(b, i)
-    fc, i = _u8(b, i)
-    _, i = _u16(b, i)
-    out = {}
-    for _ in range(fc):
-        k, v, i = _field_v1(b, i)
-        out[k] = v
-    return out
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
 
-def decode_v2(b):
-    i = 0
-    _, i = _u8(b, i)
-    fc, i = _u8(b, i)
-    _, i = _u32(b, i)
-    out = {}
-    for _ in range(fc):
-        k, v, i = _field_v2(b, i)
-        out[k] = v
-    return out
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += _encode_int(value)
 
-def _e8(x):
-    return struct.pack("B", x)
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string_v1(value)
 
-def _e32(x):
-    return struct.pack(">I", x)
+        else:
+            # For our use case we only expect ints/strings inside objects
+            raise NotImplementedError(f"unsupported object field type for {name!r}")
 
-def _estr(s):
-    b = s.encode()
-    return _e32(len(b)) + b
+        field_count += 1
 
-def _ef(name, v):
-    out = _estr(name)
-    if isinstance(v, str):
-        out += _e8(1) + _estr(v)
-    elif isinstance(v, list):
-        out += _e8(2) + _e32(len(v))
-        for s in v:
-            out += _estr(s)
-    elif isinstance(v, int):
-        out += _e8(3) + _e32(v)
-    elif isinstance(v, bytes):
-        out += _e8(5) + _e32(len(v)) + v
+    if field_count > 255:
+        raise ValueError("too many fields in object")
+
+    return bytes([field_count]) + field_bytes
+
+
+def _encode_list_v1(values, elem_type: int) -> bytes:
+    if len(values) > 0xFFFF:
+        raise ValueError("too many list elements for v1")
+
+    out = bytearray()
+    out.append(elem_type)                      # element type
+    out += struct.pack(">H", len(values))     # element count (2 bytes)
+
+    if elem_type == TYPE_INT:
+        for v in values:
+            out += _encode_int(v)
+    elif elem_type == TYPE_STRING:
+        for v in values:
+            out += _encode_string_v1(v)
+    elif elem_type == TYPE_OBJECT:
+        for v in values:
+            if not isinstance(v, dict):
+                raise ValueError("list with object type but non-dict value")
+            out += _encode_object_v1(v)
     else:
-        out += _e8(1) + _estr(str(v))
-    return out
+        raise NotImplementedError("unsupported list element type")
 
-def encode_message(obj):
-    body = b""
-    for k, v in obj.items():
-        body += _ef(k, v)
-    fc = len(obj)
-    h = b"\x02" + _e8(fc) + _e32(len(body) + 6)
-    return h + body
+    return bytes(out)
 
 
-USERS = {}
-TOKENS = {}
-ORDERS = []
-V2_ORDERS = []
-TRADES = []
+# ---------- ENCODING (v2 helpers) ----------
+
+def _encode_string_v2(value: str) -> bytes:
+    data = value.encode("utf-8")
+    # 4-byte length, up to 4GB
+    return struct.pack(">I", len(data)) + data
 
 
-class Handler(BaseHTTPRequestHandler):
-    def _read_body(self):
-        l = int(self.headers.get("Content-Length", "0"))
-        if l <= 0:
-            return b""
-        return self.rfile.read(l)
+def _encode_bytes_v2(value: bytes) -> bytes:
+    # 4-byte length + raw bytes
+    return struct.pack(">I", len(value)) + value
 
-    def _send_no_content(self, s):
-        self.send_response(s)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
 
-    def _send_gbuf(self, s, o):
-        b = encode_message(o)
-        self.send_response(s)
-        self.send_header("Content-Type", "application/x-galacticbuf")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+def _encode_object_v2(obj: dict) -> bytes:
+    """
+    Encodes an object (type 0x04 value) in v2:
+    [field_count][field1][field2]...[fieldN]
+    Each field: [name_len][name][type][value] with v2 sizes (4-byte string/bytes length, 4-byte list count).
+    We support ints, strings, bytes inside objects (same as v2 decoder).
+    """
+    field_bytes = bytearray()
+    field_count = 0
 
-    def _auth(self):
-        a = self.headers.get("Authorization") or ""
-        if not a.startswith("Bearer "):
-            return None
-        t = a[7:].strip()
-        return TOKENS.get(t)
+    for name, value in obj.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length in object")
 
-    def do_GET(self):
-        p = urlparse(self.path)
-        if p.path == "/health":
-            w = b"OK"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(w)))
-            self.end_headers()
-            self.wfile.write(w)
-        elif p.path == "/orders":
-            self.handle_list_orders(p)
-        elif p.path == "/trades":
-            self.handle_list_trades()
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
+
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += struct.pack(">q", int(value))
+
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string_v2(value)
+
+        elif isinstance(value, (bytes, bytearray)):
+            field_bytes.append(TYPE_BYTES)
+            field_bytes += _encode_bytes_v2(bytes(value))
+
         else:
-            self.send_response(404)
-            self.end_headers()
+            raise NotImplementedError(f"unsupported object field type for {name!r}: {type(value)}")
 
-    def do_POST(self):
-        if self.path == "/register":
-            self.handle_register()
-        elif self.path == "/login":
-            self.handle_login()
-        elif self.path == "/orders":
-            self.handle_submit_order()
-        elif self.path == "/trades":
-            self.handle_take_order()
-        elif self.path == "/v2/orders":
-            self.handle_v2_submit_order()
+        field_count += 1
+
+    if field_count > 255:
+        raise ValueError("too many fields in object")
+
+    return bytes([field_count]) + field_bytes
+
+
+def _encode_list_v2(values, elem_type: int) -> bytes:
+    """
+    v2 list encoding:
+    [elem_type][4-byte count][encoded elements...]
+    """
+    out = bytearray()
+    out.append(elem_type)
+    out += struct.pack(">I", len(values))
+
+    if elem_type == TYPE_INT:
+        for v in values:
+            out += struct.pack(">q", int(v))
+    elif elem_type == TYPE_STRING:
+        for v in values:
+            out += _encode_string_v2(v)
+    elif elem_type == TYPE_OBJECT:
+        for v in values:
+            if not isinstance(v, dict):
+                raise ValueError("list with object type but non-dict value")
+            out += _encode_object_v2(v)
+    elif elem_type == TYPE_BYTES:
+        for v in values:
+            out += _encode_bytes_v2(bytes(v))
+    else:
+        raise NotImplementedError("unsupported list element type for v2")
+
+    return bytes(out)
+
+
+def encode_message(fields: dict) -> bytes:
+    """
+    Encode as GalacticBuf v2 (version 0x02).
+    - 6-byte header: [version=0x02][field_count][total_length(4 bytes)]
+    - 4-byte string lengths
+    - 4-byte list element counts
+    - bytes supported (TYPE_BYTES)
+    """
+    field_bytes = bytearray()
+
+    for name, value in fields.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length")
+
+        # field name length + name
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
+
+        # type + value
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += struct.pack(">q", int(value))
+
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string_v2(value)
+
+        elif isinstance(value, (bytes, bytearray)):
+            field_bytes.append(TYPE_BYTES)
+            field_bytes += _encode_bytes_v2(bytes(value))
+
+        elif isinstance(value, list):
+            # choose element type
+            if not value:
+                # empty list – encode as empty list of strings by convention
+                elem_type = TYPE_STRING
+            elif all(isinstance(v, int) for v in value):
+                elem_type = TYPE_INT
+            elif all(isinstance(v, str) for v in value):
+                elem_type = TYPE_STRING
+            elif all(isinstance(v, dict) for v in value):
+                elem_type = TYPE_OBJECT
+            elif all(isinstance(v, (bytes, bytearray)) for v in value):
+                elem_type = TYPE_BYTES
+            else:
+                raise NotImplementedError("mixed-type lists not supported in v2 encoder")
+
+            field_bytes.append(TYPE_LIST)
+            field_bytes += _encode_list_v2(value, elem_type)
+
+        elif isinstance(value, dict):
+            field_bytes.append(TYPE_OBJECT)
+            field_bytes += _encode_object_v2(value)
+
         else:
-            self.send_response(404)
-            self.end_headers()
+            raise NotImplementedError(f"unsupported type for field {name!r}: {type(value)}")
 
-    def do_PUT(self):
-        if self.path == "/user/password":
-            self.handle_change_password()
+    version = 0x02
+    field_count = len(fields)
+    total_length = 6 + len(field_bytes)  # header (6) + payload
+
+    header = struct.pack(">BBI", version, field_count, total_length)
+    return header + field_bytes
+
+
+# ---------- DECODING HELPERS (shared) ----------
+
+def _decode_object_v1(data: bytes, offset: int):
+    """Decode an object (type 0x04) using v1 sizes (2-byte string lengths)."""
+    if offset >= len(data):
+        raise ValueError("truncated object (field count)")
+    field_count = data[offset]
+    offset += 1
+
+    obj = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated object (field name len)")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated object (field name)")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated object (type id)")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated object int")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+
+        elif type_id == TYPE_STRING:
+            if offset + 2 > len(data):
+                raise ValueError("truncated object string len")
+            str_len = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+            if offset + str_len > len(data):
+                raise ValueError("truncated object string data")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+
         else:
-            self.send_response(404)
-            self.end_headers()
+            raise NotImplementedError("objects with nested lists/objects/bytes not implemented (v1)")
 
-    def handle_register(self):
-        try:
-            d = decode_message(self._read_body())
-        except:
-            self._send_no_content(400)
-            return
-        u = (d.get("username") or "").strip()
-        p = (d.get("password") or "").strip()
-        if not u or not p:
-            self._send_no_content(400)
-            return
-        if u in USERS:
-            self._send_no_content(409)
-            return
-        USERS[u] = p
-        self._send_no_content(204)
+        obj[name] = value
 
-    def handle_login(self):
-        try:
-            d = decode_message(self._read_body())
-        except:
-            self._send_no_content(401)
-            return
-        u = (d.get("username") or "").strip()
-        p = (d.get("password") or "").strip()
-        if not u or not p:
-            self._send_no_content(401)
-            return
-        if USERS.get(u) != p:
-            self._send_no_content(401)
-            return
-        t = uuid.uuid4().hex
-        TOKENS[t] = u
-        self._send_gbuf(200, {"token": t})
-
-    def handle_change_password(self):
-        try:
-            d = decode_message(self._read_body())
-        except:
-            self._send_no_content(400)
-            return
-        u = (d.get("username") or "").strip()
-        op = (d.get("old_password") or "").strip()
-        np = (d.get("new_password") or "").strip()
-        if not u or not op or not np:
-            self._send_no_content(400)
-            return
-        if USERS.get(u) != op:
-            self._send_no_content(401)
-            return
-        USERS[u] = np
-        r = [k for k,v in TOKENS.items() if v == u]
-        for k in r:
-            del TOKENS[k]
-        self._send_no_content(204)
-
-    def handle_list_orders(self, p):
-        q = parse_qs(p.query)
-        if "delivery_start" not in q or "delivery_end" not in q:
-            self._send_no_content(400)
-            return
-        try:
-            ds = int(q["delivery_start"][0])
-            de = int(q["delivery_end"][0])
-        except:
-            self._send_no_content(400)
-            return
-        m = [o for o in ORDERS if o["active"] and o["delivery_start"]==ds and o["delivery_end"]==de]
-        m.sort(key=lambda o:o["price"])
-        out = []
-        for o in m:
-            out.append({
-                "order_id": o["order_id"],
-                "price": o["price"],
-                "quantity": o["quantity"],
-                "delivery_start": o["delivery_start"],
-                "delivery_end": o["delivery_end"]
-            })
-        self._send_gbuf(200, {"orders": out})
-
-    def handle_submit_order(self):
-        u = self._auth()
-        if not u:
-            self._send_no_content(401)
-            return
-        try:
-            d = decode_message(self._read_body())
-        except:
-            self._send_no_content(400)
-            return
-        try:
-            p = int(d.get("price"))
-            q = int(d.get("quantity"))
-            ds = int(d.get("delivery_start"))
-            de = int(d.get("delivery_end"))
-        except:
-            self._send_no_content(400)
-            return
-        if q<=0:
-            self._send_no_content(400)
-            return
-        H=3600000
-        if ds%H!=0 or de%H!=0 or de-ds!=H:
-            self._send_no_content(400)
-            return
-        oid=uuid.uuid4().hex
-        ORDERS.append({
-            "order_id":oid,
-            "seller_id":u,
-            "price":p,
-            "quantity":q,
-            "delivery_start":ds,
-            "delivery_end":de,
-            "active":True
-        })
-        self._send_gbuf(200, {"order_id":oid})
-
-    def handle_v2_submit_order(self):
-        u=self._auth()
-        if not u:
-            self._send_no_content(401)
-            return
-        try:
-            d=decode_message(self._read_body())
-        except:
-            self._send_no_content(400)
-            return
-        s=(d.get("side") or "").strip()
-        if s not in ("buy","sell"):
-            self._send_no_content(400)
-            return
-        try:
-            p=int(d.get("price"))
-            q=int(d.get("quantity"))
-            ds=int(d.get("delivery_start"))
-            de=int(d.get("delivery_end"))
-        except:
-            self._send_no_content(400)
-            return
-        if q<=0:
-            self._send_no_content(400)
-            return
-        H=3600000
-        if ds%H!=0 or de%H!=0 or de-ds!=H:
-            self._send_no_content(400)
-            return
-        oid=uuid.uuid4().hex
-        V2_ORDERS.append({
-            "order_id":oid,
-            "side":s,
-            "user_id":u,
-            "price":p,
-            "quantity":q,
-            "delivery_start":ds,
-            "delivery_end":de,
-            "status":"ACTIVE"
-        })
-        self._send_gbuf(200, {"order_id":oid})
-
-    def handle_list_trades(self):
-        t=sorted(TRADES,key=lambda x:x["timestamp"],reverse=True)
-        out=[]
-        for x in t:
-            out.append({
-                "trade_id":x["trade_id"],
-                "buyer_id":x["buyer_id"],
-                "seller_id":x["seller_id"],
-                "price":x["price"],
-                "quantity":x["quantity"],
-                "timestamp":x["timestamp"]
-            })
-        self._send_gbuf(200, {"trades":out})
-
-    def handle_take_order(self):
-        u=self._auth()
-        if not u:
-            self._send_no_content(401)
-            return
-        try:
-            d=decode_message(self._read_body())
-        except:
-            self._send_no_content(400)
-            return
-        oid=(d.get("order_id") or "").strip()
-        if not oid:
-            self._send_no_content(400)
-            return
-        o=None
-        for x in ORDERS:
-            if x["order_id"]==oid and x["active"]:
-                o=x
-                break
-        if not o:
-            self._send_no_content(404)
-            return
-        o["active"]=False
-        ORDERS.remove(o)
-        tid=uuid.uuid4().hex
-        ts=int(time.time()*1000)
-        TRADES.append({
-            "trade_id":tid,
-            "buyer_id":u,
-            "seller_id":o["seller_id"],
-            "price":o["price"],
-            "quantity":o["quantity"],
-            "timestamp":ts
-        })
-        self._send_gbuf(200, {"trade_id":tid})
+    return obj, offset
 
 
-def run():
-    s=HTTPServer(("",8080),Handler)
-    print("Server running on port 8080...")
-    s.serve_forever()
+def _decode_object_v2(data: bytes, offset: int):
+    """Decode an object (type 0x04) using v2 sizes (4-byte string lengths)."""
+    if offset >= len(data):
+        raise ValueError("truncated object (field count)")
+    field_count = data[offset]
+    offset += 1
 
-if __name__=="__main__":
-    run()
+    obj = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated object (field name len)")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated object (field name)")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated object (type id)")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated object int")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+
+        elif type_id == TYPE_STRING:
+            if offset + 4 > len(data):
+                raise ValueError("truncated object string len (v2)")
+            str_len = struct.unpack(">I", data[offset:offset + 4])[0]
+            offset += 4
+            if offset + str_len > len(data):
+                raise ValueError("truncated object string data (v2)")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+
+        elif type_id == TYPE_BYTES:
+            if offset + 4 > len(data):
+                raise ValueError("truncated object bytes len (v2)")
+            b_len = struct.unpack(">I", data[offset:offset + 4])[0]
+            offset += 4
+            if offset + b_len > len(data):
+                raise ValueError("truncated object bytes data (v2)")
+            value = data[offset:offset + b_len]
+            offset += b_len
+
+        else:
+            raise NotImplementedError("objects with nested lists/objects not implemented (v2)")
+
+        obj[name] = value
+
+    return obj, offset
+
+
+# ---------- DECODING v1 ----------
+
+def _decode_message_v1(data: bytes) -> dict:
+    if len(data) < 4:
+        raise ValueError("message too short for v1")
+
+    version, field_count, total_len = struct.unpack(">BBH", data[:4])
+    if version != 0x01:
+        raise ValueError(f"v1 decoder got wrong version {version}")
+
+    offset = 4
+    result = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated message (field name length)")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated message (field name)")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated message (type id)")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated int value")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+
+        elif type_id == TYPE_STRING:
+            if offset + 2 > len(data):
+                raise ValueError("truncated string length")
+            str_len = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+            if offset + str_len > len(data):
+                raise ValueError("truncated string data")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+
+        elif type_id == TYPE_LIST:
+            if offset + 3 > len(data):
+                raise ValueError("truncated list header")
+            elem_type = data[offset]
+            offset += 1
+            count = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+
+            items = []
+            if elem_type == TYPE_INT:
+                for _ in range(count):
+                    if offset + 8 > len(data):
+                        raise ValueError("truncated list int")
+                    items.append(struct.unpack(">q", data[offset:offset + 8])[0])
+                    offset += 8
+            elif elem_type == TYPE_STRING:
+                for _ in range(count):
+                    if offset + 2 > len(data):
+                        raise ValueError("truncated list string len")
+                    sl = struct.unpack(">H", data[offset:offset + 2])[0]
+                    offset += 2
+                    if offset + sl > len(data):
+                        raise ValueError("truncated list string data")
+                    items.append(data[offset:offset + sl].decode("utf-8"))
+                    offset += sl
+            elif elem_type == TYPE_OBJECT:
+                for _ in range(count):
+                    obj, offset = _decode_object_v1(data, offset)
+                    items.append(obj)
+            else:
+                raise NotImplementedError("list element type not implemented (v1)")
+
+            value = items
+
+        elif type_id == TYPE_OBJECT:
+            obj, offset = _decode_object_v1(data, offset)
+            value = obj
+
+        else:
+            raise NotImplementedError(f"type id {type_id} not implemented yet in v1")
+
+        result[name] = value
+
+    return result
+
+
+# ---------- DECODING v2 ----------
+
+def _decode_message_v2(data: bytes) -> dict:
+    if len(data) < 6:
+        raise ValueError("message too short for v2")
+
+    version, field_count, total_len = struct.unpack(">BBI", data[:6])
+    if version != 0x02:
+        raise ValueError(f"v2 decoder got wrong version {version}")
+
+    offset = 6
+    result = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated message (field name length) [v2]")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated message (field name) [v2]")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated message (type id) [v2]")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated int value [v2]")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+
+        elif type_id == TYPE_STRING:
+            if offset + 4 > len(data):
+                raise ValueError("truncated string length [v2]")
+            str_len = struct.unpack(">I", data[offset:offset + 4])[0]
+            offset += 4
+            if offset + str_len > len(data):
+                raise ValueError("truncated string data [v2]")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+
+        elif type_id == TYPE_BYTES:
+            if offset + 4 > len(data):
+                raise ValueError("truncated bytes length [v2]")
+            b_len = struct.unpack(">I", data[offset:offset + 4])[0]
+            offset += 4
+            if offset + b_len > len(data):
+                raise ValueError("truncated bytes data [v2]")
+            value = data[offset:offset + b_len]
+            offset += b_len
+
+        elif type_id == TYPE_LIST:
+            if offset + 5 > len(data):
+                raise ValueError("truncated list header [v2]")
+            elem_type = data[offset]
+            offset += 1
+            count = struct.unpack(">I", data[offset:offset + 4])[0]
+            offset += 4
+
+            items = []
+            if elem_type == TYPE_INT:
+                for _ in range(count):
+                    if offset + 8 > len(data):
+                        raise ValueError("truncated list int [v2]")
+                    items.append(struct.unpack(">q", data[offset:offset + 8])[0])
+                    offset += 8
+
+            elif elem_type == TYPE_STRING:
+                for _ in range(count):
+                    if offset + 4 > len(data):
+                        raise ValueError("truncated list string len [v2]")
+                    sl = struct.unpack(">I", data[offset:offset + 4])[0]
+                    offset += 4
+                    if offset + sl > len(data):
+                        raise ValueError("truncated list string data [v2]")
+                    items.append(data[offset:offset + sl].decode("utf-8"))
+                    offset += sl
+
+            elif elem_type == TYPE_OBJECT:
+                for _ in range(count):
+                    obj, offset = _decode_object_v2(data, offset)
+                    items.append(obj)
+
+            elif elem_type == TYPE_BYTES:
+                for _ in range(count):
+                    if offset + 4 > len(data):
+                        raise ValueError("truncated list bytes len [v2]")
+                    bl = struct.unpack(">I", data[offset:offset + 4])[0]
+                    offset += 4
+                    if offset + bl > len(data):
+                        raise ValueError("truncated list bytes data [v2]")
+                    items.append(data[offset:offset + bl])
+                    offset += bl
+
+            else:
+                raise NotImplementedError("list element type not implemented (v2)")
+
+            value = items
+
+        elif type_id == TYPE_OBJECT:
+            obj, offset = _decode_object_v2(data, offset)
+            value = obj
+
+        else:
+            raise NotImplementedError(f"type id {type_id} not implemented yet in v2")
+
+        result[name] = value
+
+    return result
+
+
+# ---------- PUBLIC API ----------
+
+def decode_message(data: bytes) -> dict:
+    if not data:
+        raise ValueError("empty galacticbuf message")
+
+    version = data[0]
+    if version == 0x01:
+        return _decode_message_v1(data)
+    elif version == 0x02:
+        return _decode_message_v2(data)
+    else:
+        raise ValueError(f"unsupported GalacticBuf version: {version}")
+
+
+if __name__ == "__main__":
+    # Simple self-test
+    msg = encode_message({
+        "user_id": 1001,
+        "name": "Alice",
+        "scores": [100, 200, 300],
+    })
+    print(len(msg), msg.hex())
+    print(decode_message(msg))
