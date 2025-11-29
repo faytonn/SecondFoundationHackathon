@@ -158,6 +158,60 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"token": token})
 
+
+    def handle_change_password(self):
+        # Request body (GalacticBuf):
+        #   username (string)
+        #   old_password (string)
+        #   new_password (string)
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            # invalid GalacticBuf
+            self._send_no_content(400)
+            return
+
+        username = (data.get("username") or "").strip()
+        old_password = (data.get("old_password") or "").strip()
+        new_password = (data.get("new_password") or "").strip()
+
+        # 400 Bad Request – missing/empty fields
+        if not username or not old_password or not new_password:
+            self._send_no_content(400)
+            return
+
+        user_password = USERS.get(username)
+
+        # 401 Unauthorized – user not found
+        if user_password is None:
+            self._send_no_content(401)
+            return
+
+        # 401 Unauthorized – old password doesn't match
+        if user_password != old_password:
+            self._send_no_content(401)
+            return
+
+        try:
+            # Update password
+            USERS[username] = new_password
+
+            # Invalidate all existing tokens for this user
+            tokens_to_delete = [
+                token for token, u in TOKENS.items() if u == username
+            ]
+            for token in tokens_to_delete:
+                del TOKENS[token]
+
+        except Exception:
+            # Any unexpected error → 500
+            self._send_no_content(500)
+            return
+
+        # 204 No Content – success
+        self._send_no_content(204)
     # ---------- /orders (GET) ----------
 
     def handle_list_orders(self, parsed):
