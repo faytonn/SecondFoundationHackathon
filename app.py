@@ -1,10 +1,15 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
-from galacticbuffer import encode_message, decode_message
+import logging
 import uuid
 import time
 import base64
 import hashlib
+import os
+from urllib.parse import urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from galacticbuffer import encode_message, decode_message
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
 
 USERS = {}
 TOKENS = {}
@@ -22,13 +27,15 @@ TRADE_STREAM_CLIENTS = []
 ORDER_BOOK_STREAM_CLIENTS = []
 EXECUTION_REPORT_CLIENTS = {}
 
+PERSIST_PATH = os.environ.get("PERSISTENT_DIR", ".")
+STATE_FILE = os.path.join(PERSIST_PATH, "exchange_state.json")
+
 
 class Handler(BaseHTTPRequestHandler):
     def _check_trading_window(self, delivery_start: int):
         now_ms = int(time.time() * 1000)
-
-        OPEN_MS = 15 * 24 * 60 * 60 * 1000
-        CLOSE_MS = 60 * 1000
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000  # 15 days
+        CLOSE_MS = 60 * 1000  # 1 min
 
         open_time = delivery_start - OPEN_MS
         close_time = delivery_start - CLOSE_MS
@@ -48,10 +55,16 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return b""
+            return self.rfile.read(length)
+        except Exception as e:
+            logging.error(f"Error reading body: {e}")
+            self.send_response(400)
+            self.end_headers()
             return b""
-        return self.rfile.read(length)
 
     def _send_no_content(self, status: int):
         self.send_response(status)
@@ -74,211 +87,54 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         return TOKENS.get(token)
-        
-    def _read_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0:
-                return b""
-            return self.rfile.read(length)
-        except Exception as e:
-            # Log the error for debugging
-            print(f"Error reading body: {e}")
-            return b""
 
     def _apply_trade_balances(self, buyer_id: str, seller_id: str, price: int, quantity: int):
         amount = int(price) * int(quantity)
         BALANCES[buyer_id] = BALANCES.get(buyer_id, 0) - amount
         BALANCES[seller_id] = BALANCES.get(seller_id, 0) + amount
-    def _commit_bulk_operations(self, staged_operations):
-    for result in staged_operations:
-        if result["action"] == "create":
-            self._create_order(result)
-        elif result["action"] == "modify":
-            self._modify_order(result)
-        elif result["action"] == "cancel":
-            self._cancel_order(result)
-    def _generate_results(self, staged_operations):
-    results = []
-    for result in staged_operations:
-        entry = {
-            "type": result["action"],
-            "order_id": result["order_id"],
-            "status": result.get("status")
-        }
-        if result.get("trades"):
-            entry["trades"] = result["trades"]
-        results.append(entry)
-    return results
 
-    self._send_gbuf(200, {"results": self._generate_results(staged_operations)})
+    def _commit_bulk_operations(self, staged_operations):
+        for result in staged_operations:
+            if result["action"] == "create":
+                self._create_order(result)
+            elif result["action"] == "modify":
+                self._modify_order(result)
+            elif result["action"] == "cancel":
+                self._cancel_order(result)
+
+        self._send_gbuf(200, {"results": self._generate_results(staged_operations)})
+
+    def _generate_results(self, staged_operations):
+        results = []
+        for result in staged_operations:
+            entry = {
+                "type": result["action"],
+                "order_id": result["order_id"],
+                "status": result.get("status")
+            }
+            if result.get("trades"):
+                entry["trades"] = result["trades"]
+            results.append(entry)
+        return results
 
     def _create_order(self, result):
-        # Handle creation of new orders in V2_ORDERS and order book
         order_data = result["order"]
         if order_data:
             V2_ORDERS.append(order_data)
             self._broadcast_order_book_change(order_data, "ADD")
-    
+
     def _modify_order(self, result):
-        # Modify existing orders in V2_ORDERS and broadcast changes
         order_id = result["order_id"]
         target_order = next(o for o in V2_ORDERS if o["order_id"] == order_id)
         target_order.update(result)
         self._broadcast_order_book_change(target_order, "MODIFY")
-    
+
     def _cancel_order(self, result):
-        # Cancel orders by updating their status and removing from order book
         order_id = result["order_id"]
         target_order = next(o for o in V2_ORDERS if o["order_id"] == order_id)
         target_order["status"] = "CANCELLED"
         target_order["quantity"] = 0
         self._broadcast_order_book_change(target_order, "REMOVE")
-
-    def _compute_potential_balance(self, username: str) -> int:
-        balance = BALANCES.get(username, 0)
-
-        for o in ORDERS:
-            if not o.get("active", True):
-                continue
-            if o.get("seller_id") != username:
-                continue
-            try:
-                qty = int(o.get("quantity", 0))
-                price = int(o.get("price", 0))
-            except Exception:
-                continue
-            if qty <= 0:
-                continue
-            balance += price * qty
-
-        for o in V2_ORDERS:
-            if o.get("owner") != username:
-                continue
-            if o.get("status") != "ACTIVE":
-                continue
-            try:
-                qty = int(o.get("quantity", 0))
-                price = int(o.get("price", 0))
-            except Exception:
-                continue
-            if qty <= 0:
-                continue
-
-            side = o.get("side")
-            if side == "buy":
-                balance -= price * qty
-            elif side == "sell":
-                balance += price * qty
-
-        return balance
-
-    def _validate_dna_sample(self, dna: str) -> bool:
-        if not dna:
-            return False
-        if len(dna) % 3 != 0:
-            return False
-        for ch in dna:
-            if ch not in ("C", "G", "A", "T"):
-                return False
-        return True
-
-    def _split_codons(self, dna: str):
-        return [dna[i:i+3] for i in range(0, len(dna), 3)]
-
-    def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
-        n = len(ref_codons)
-        m = len(sample_codons)
-
-        if max_diff < 0:
-            return max_diff + 1
-
-        if abs(n - m) > max_diff:
-            return max_diff + 1
-
-        if n == 0:
-            return m
-        if m == 0:
-            return n
-
-        prev = {}
-        for j in range(0, min(m, max_diff) + 1):
-            prev[j] = j
-
-        for i in range(1, n + 1):
-            j_min = max(0, i - max_diff)
-            j_max = min(m, i + max_diff)
-            curr = {}
-
-            for j in range(j_min, j_max + 1):
-                if j > j_min:
-                    ins = curr[j - 1] + 1
-                else:
-                    ins = max_diff + 1
-
-                dele = prev.get(j, max_diff + 1) + 1
-
-                if j - 1 in prev:
-                    sub_cost = 0 if ref_codons[i - 1] == sample_codons[j - 1] else 1
-                    sub = prev[j - 1] + sub_cost
-                else:
-                    sub = max_diff + 1
-
-                curr[j] = min(ins, dele, sub)
-
-            if min(curr.values()) > max_diff:
-                return max_diff + 1
-
-            prev = curr
-
-        dist = prev.get(m, max_diff + 1)
-        return dist
-
-    def _dna_matches(self, reference: str, submitted: str) -> bool:
-        ref_codons = self._split_codons(reference)
-        sub_codons = self._split_codons(submitted)
-
-        ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000
-        max_diff = allowed_diff
-
-        dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
-        return dist <= allowed_diff
-
-    def _ws_build_binary_frame(self, payload: bytes) -> bytes:
-        fin_opcode = 0x82
-        length = len(payload)
-        if length < 126:
-            header = bytes([fin_opcode, length])
-        elif length < (1 << 16):
-            header = bytes([fin_opcode, 126]) + length.to_bytes(2, "big")
-        else:
-            header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
-        return header + payload
-
-    def _broadcast_trade(self, trade: dict):
-        if not TRADE_STREAM_CLIENTS:
-            return
-        payload = encode_message({
-            "trade_id": str(trade["trade_id"]),
-            "buyer_id": str(trade["buyer_id"]),
-            "seller_id": str(trade["seller_id"]),
-            "price": int(trade["price"]),
-            "quantity": int(trade["quantity"]),
-            "delivery_start": int(trade["delivery_start"]),
-            "delivery_end": int(trade["delivery_end"]),
-            "timestamp": int(trade["timestamp"]),
-        })
-        frame = self._ws_build_binary_frame(payload)
-
-        for sock in list(TRADE_STREAM_CLIENTS):
-            try:
-                sock.sendall(frame)
-            except Exception:
-                try:
-                    TRADE_STREAM_CLIENTS.remove(sock)
-                except ValueError:
-                    pass
 
     def _broadcast_order_book_change(self, order: dict, change_type: str):
         if not ORDER_BOOK_STREAM_CLIENTS:
@@ -305,56 +161,71 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-    def _broadcast_execution_report_for_order(self, order: dict):
-        if not EXECUTION_REPORT_CLIENTS:
-            return
-        owner = order.get("owner")
-        if not owner:
-            return
-        clients = EXECUTION_REPORT_CLIENTS.get(owner)
-        if not clients:
-            return
+    def _ws_build_binary_frame(self, payload: bytes) -> bytes:
+        fin_opcode = 0x82
+        length = len(payload)
+        if length < 126:
+            header = bytes([fin_opcode, length])
+        elif length < (1 << 16):
+            header = bytes([fin_opcode, 126]) + length.to_bytes(2, "big")
+        else:
+            header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
+        return header + payload
 
+    def handle_bulk_operations(self):
         try:
-            original_qty = int(order.get("original_quantity", order.get("quantity", 0)))
+            body = self._read_body()
+            data = decode_message(body)
         except Exception:
-            original_qty = int(order.get("quantity", 0) or 0)
-        try:
-            remaining = int(order.get("quantity", 0))
-        except Exception:
-            remaining = 0
+            logging.error("Failed to decode body")
+            self._send_no_content(400)
+            return
 
-        if remaining < 0:
-            remaining = 0
+        contracts = data.get("contracts")
+        if not isinstance(contracts, list) or not contracts:
+            logging.error("Invalid contracts list")
+            self._send_no_content(400)
+            return
 
-        filled = original_qty - remaining
-        if filled < 0:
-            filled = 0
+        staged_operations = []
 
-        status = order.get("status", "ACTIVE")
-
-        payload = encode_message({
-            "order_id": str(order["order_id"]),
-            "status": status,
-            "side": order["side"],
-            "price": int(order["price"]),
-            "filled_quantity": int(filled),
-            "remaining_quantity": int(remaining),
-            "delivery_start": int(order["delivery_start"]),
-            "delivery_end": int(order["delivery_end"]),
-            "timestamp": int(time.time() * 1000),
-        })
-        frame = self._ws_build_binary_frame(payload)
-
-        for sock in list(clients):
+        for contract in contracts:
             try:
-                sock.sendall(frame)
-            except Exception:
-                try:
-                    clients.remove(sock)
-                except ValueError:
-                    pass
+                ds = int(contract["delivery_start"])
+                de = int(contract["delivery_end"])
+            except KeyError:
+                logging.error("Missing delivery window")
+                self._send_no_content(400)
+                return
+            if de <= ds or (de - ds != 3600000):  # 1 hour
+                self._send_no_content(400)
+                return
 
+            if not self._check_trading_window(ds):
+                return
+
+            for op in contract.get("operations", []):
+                result = self._handle_operation(op, ds, de, staged_operations)
+                if not result["ok"]:
+                    self._send_no_content(result["status"])
+                    return
+                staged_operations.append(result)
+
+        self._commit_bulk_operations(staged_operations)
+
+    def _handle_operation(self, op, ds, de, staged_operations):
+        try:
+            if op["type"] == "create":
+                return self._bulk_sim_create(op["participant_token"], op, ds, de, staged_operations)
+            elif op["type"] == "modify":
+                return self._bulk_sim_modify(op["participant_token"], op, ds, de, staged_operations)
+            elif op["type"] == "cancel":
+                return self._bulk_sim_cancel(op["participant_token"], op, ds, de, staged_operations)
+        except Exception as e:
+            logging.error(f"Error handling operation: {e}")
+            return {"ok": False, "status": 400}
+
+    # Define methods for bulk operations (create, modify, cancel)
     def _bulk_sim_create(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
         try:
             side = (op.get("side") or "").strip()
@@ -523,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
             if c.get("owner") == username:
                 return {"ok": False, "status": 412}
 
-        if not self._check_collateral_modify_in_sim(username, order_id, new_price, new_quantity, staged_ops):
+        if not self._check_collateral_modify(username, order_id, new_price, new_quantity, staged_ops):
             return {"ok": False, "status": 402}
 
         remaining = new_quantity
@@ -690,80 +561,87 @@ class Handler(BaseHTTPRequestHandler):
 
         return None
 
-def _check_collateral_in_sim_state(self, username: str, side: str, price: int, quantity: int, staged_ops: list):
-    coll = COLLATERAL.get(username)
-    if coll is None:
-        return True
+    def _check_collateral_in_sim_state(self, username: str, side: str, price: int, quantity: int, staged_ops: list):
+        coll = COLLATERAL.get(username)
+        if coll is None:
+            return True
 
-    if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
-        return True
+        if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
+            return True
 
-    balance = BALANCES.get(username, 0)
+        balance = BALANCES.get(username, 0)
 
-    for sop in staged_ops:
-        for trade in sop.get("trades", []):
-            buyer = trade["buyer_id"]
-            seller = trade["seller_id"]
-            amount = trade["price"] * trade["quantity"]
-            if buyer == username:
-                balance -= amount
-            elif seller == username:
-                balance += amount
-
-    for o in V2_ORDERS:
-        if o.get("owner") != username:
-            continue
-        if o.get("status") != "ACTIVE":
-            continue
-        qty = int(o.get("quantity", 0))
-        if qty <= 0:
-            continue
-
-        skip = False
         for sop in staged_ops:
-            if sop.get("order_id") == o["order_id"]:
-                if sop["action"] in ("modify", "cancel"):
-                    skip = True
-                    break
-        if skip:
-            continue
+            for trade in sop.get("trades", []):
+                buyer = trade["buyer_id"]
+                seller = trade["seller_id"]
+                amount = trade["price"] * trade["quantity"]
+                if buyer == username:
+                    balance -= amount
+                elif seller == username:
+                    balance += amount
 
-        p = int(o["price"])
-        s = o["side"]
-        if s == "buy":
-            balance -= p * qty
-        else:
-            balance += p * qty
+        for o in V2_ORDERS:
+            if o.get("owner") != username:
+                continue
+            if o.get("status") != "ACTIVE":
+                continue
+            qty = int(o.get("quantity", 0))
+            if qty <= 0:
+                continue
 
-    for sop in staged_ops:
-        if sop["action"] == "create" and sop.get("order"):
-            od = sop["order"]
-            if od["owner"] == username:
-                qty = od["quantity"]
-                p = od["price"]
-                s = od["side"]
-                if s == "buy":
-                    balance -= p * qty
-                else:
-                    balance += p * qty
-        elif sop["action"] == "modify":
-            for o in V2_ORDERS:
-                if o["order_id"] == sop["order_id"] and o["owner"] == username:
-                    qty = sop["new_quantity"]
-                    p = sop["new_price"]
-                    s = o["side"]
+            skip = False
+            for sop in staged_ops:
+                if sop.get("order_id") == o["order_id"]:
+                    if sop["action"] in ("modify", "cancel"):
+                        skip = True
+                        break
+            if skip:
+                continue
+
+            p = int(o["price"])
+            s = o["side"]
+            if s == "buy":
+                balance -= p * qty
+            else:
+                balance += p * qty
+
+        for sop in staged_ops:
+            if sop["action"] == "create" and sop.get("order"):
+                od = sop["order"]
+                if od["owner"] == username:
+                    qty = od["quantity"]
+                    p = od["price"]
+                    s = od["side"]
                     if s == "buy":
                         balance -= p * qty
                     else:
                         balance += p * qty
-                    break
+            elif sop["action"] == "modify":
+                for o in V2_ORDERS:
+                    if o["order_id"] == sop["order_id"] and o["owner"] == username:
+                        qty = sop["new_quantity"]
+                        p = sop["new_price"]
+                        s = o["side"]
+                        if s == "buy":
+                            balance -= p * qty
+                        else:
+                            balance += p * qty
+                        break
 
-    if side == "buy":
-        balance -= price * quantity
-    else:
-        balance += price * quantity
+        if side == "buy":
+            balance -= price * quantity
+        else:
+            balance += price * quantity
 
-    return balance >= -coll
+        return balance >= -coll
+
+    def do_POST(self):
+        if self.path == "/v2/bulk-operations":
+            self.handle_bulk_operations()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1115,43 +993,119 @@ def _check_collateral_in_sim_state(self, username: str, side: str, price: int, q
             except Exception:
                 pass
 
-def handle_bulk_operations(self):
-    try:
-        body = self._read_body()
-        data = decode_message(body)
-    except Exception:
-        return self._send_no_content(400)  # Bad Request if parsing fails
-
-    contracts = data.get("contracts")
-    if not isinstance(contracts, list) or not contracts:
-        return self._send_no_content(400)  # If contracts list is missing or empty
-
-    staged_operations = []
-
-    # Iterate over contracts to validate and execute operations
-    for contract in contracts:
-        # Extract and validate delivery window
+    def handle_bulk_operations(self):
         try:
-            ds = int(contract["delivery_start"])
-            de = int(contract["delivery_end"])
-        except KeyError:
-            return self._send_no_content(400)  # Missing delivery window keys
-        if de <= ds or (de - ds != 3600000):  # Ensure delivery window is 1 hour
+            body = self._read_body()
+            data = decode_message(body)
+        except Exception:
             return self._send_no_content(400)
 
-        if not self._check_trading_window(ds):  # Check for trading window validity
-            return
+        contracts = data.get("contracts")
+        if not isinstance(contracts, list) or not contracts:
+            return self._send_no_content(400)
 
-        # Handle individual operations for each contract
-        for op in contract.get("operations", []):
-            result = self._handle_operation(op, ds, de, staged_operations)
-            if not result["ok"]:
-                return self._send_no_content(result["status"])
+        staged_operations = []
 
-            staged_operations.append(result)
-    
-    # Continue processing after all operations are validated
-    self._commit_bulk_operations(staged_operations)
+        for contract in contracts:
+            try:
+                ds = int(contract["delivery_start"])
+                de = int(contract["delivery_end"])
+            except Exception:
+                return self._send_no_content(400)
+
+            ops = contract.get("operations")
+            if not isinstance(ops, list) or not ops:
+                return self._send_no_content(400)
+
+            HOUR_MS = 3600000
+            if (ds % HOUR_MS) != 0 or (de % HOUR_MS) != 0:
+                return self._send_no_content(400)
+            if de <= ds or de - ds != HOUR_MS:
+                return self._send_no_content(400)
+
+            if not self._check_trading_window(ds):
+                return
+
+            for op in ops:
+                optype = op.get("type")
+                token = op.get("participant_token", "")
+                username = TOKENS.get(token)
+                if not username:
+                    return self._send_no_content(401)
+
+                if optype == "create":
+                    result = self._bulk_sim_create(username, op, ds, de, staged_operations)
+                elif optype == "modify":
+                    result = self._bulk_sim_modify(username, op, ds, de, staged_operations)
+                elif optype == "cancel":
+                    result = self._bulk_sim_cancel(username, op, ds, de, staged_operations)
+                else:
+                    return self._send_no_content(400)
+
+                if not result["ok"]:
+                    return self._send_no_content(result["status"])
+
+                staged_operations.append(result)
+
+        for result in staged_operations:
+            if result["action"] == "create":
+                order_data = result["order"]
+                if order_data is not None and result.get("status") == "ACTIVE":
+                    V2_ORDERS.append(order_data)
+                    self._broadcast_order_book_change(order_data, "ADD")
+
+                for trade in result.get("trades", []):
+                    TRADES.append(trade)
+                    self._apply_trade_balances(
+                        trade["buyer_id"],
+                        trade["seller_id"],
+                        trade["price"],
+                        trade["quantity"]
+                    )
+                    self._broadcast_trade(trade)
+
+            elif result["action"] == "modify":
+                order_id = result["order_id"]
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["price"] = result["new_price"]
+                target["quantity"] = result["new_quantity"]
+                target["status"] = result["status"]
+                if "created_at" in result:
+                    target["created_at"] = result["created_at"]
+
+                if target["status"] == "ACTIVE":
+                    self._broadcast_order_book_change(target, "MODIFY")
+                else:
+                    self._broadcast_order_book_change(target, "REMOVE")
+
+                for trade in result.get("trades", []):
+                    TRADES.append(trade)
+                    self._apply_trade_balances(
+                        trade["buyer_id"],
+                        trade["seller_id"],
+                        trade["price"],
+                        trade["quantity"]
+                    )
+                    self._broadcast_trade(trade)
+
+            elif result["action"] == "cancel":
+                order_id = result["order_id"]
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["status"] = "CANCELLED"
+                target["quantity"] = 0
+                self._broadcast_order_book_change(target, "REMOVE")
+
+        results = []
+        for result in staged_operations:
+            entry = {
+                "type": result["action"],
+                "order_id": result["order_id"],
+            }
+            if "status" in result:
+                entry["status"] = result["status"]
+            results.append(entry)
+
+        return self._send_gbuf(200, {"results": results})
 
     def handle_dna_submit(self):
         try:
