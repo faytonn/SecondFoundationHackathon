@@ -23,6 +23,9 @@ COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
 
+# Performance cache: username -> list[list[str]] pre-split codons
+DNA_SAMPLE_CODONS = {}
+
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
 
@@ -228,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return balance
 
-    # ---------- DNA helpers ----------
+    # ---------- DNA helpers (performance aware) ----------
 
     def _validate_dna_sample(self, dna: str) -> bool:
         if not dna:
@@ -241,7 +244,29 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _split_codons(self, dna: str):
+        # Returns list of codons (strings of length 3)
         return [dna[i:i+3] for i in range(0, len(dna), 3)]
+
+    def _get_user_dna_codons(self, username: str):
+        """
+        Ensure we have pre-split codons cached for all samples of this user.
+        Uses DNA_SAMPLES (persisted) as the single source of truth.
+        """
+        samples = DNA_SAMPLES.get(username) or []
+        cached = DNA_SAMPLE_CODONS.get(username)
+
+        if cached is None or len(cached) != len(samples):
+            # (Re)build cache from stored strings
+            cached = []
+            for s in samples:
+                # Older state may have plain strings only
+                if isinstance(s, str):
+                    cached.append(self._split_codons(s))
+                else:
+                    cached.append(self._split_codons(str(s)))
+            DNA_SAMPLE_CODONS[username] = cached
+
+        return cached
 
     def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
         """
@@ -302,15 +327,20 @@ class Handler(BaseHTTPRequestHandler):
         dist = prev.get(m, max_diff + 1)
         return dist
 
-    def _dna_matches(self, reference: str, submitted: str) -> bool:
-        ref_codons = self._split_codons(reference)
-        sub_codons = self._split_codons(submitted)
-
+    def _dna_matches_codons(self, ref_codons, sub_codons) -> bool:
+        """
+        Performance-oriented comparison using pre-split codon lists.
+        """
         ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000  # floor(Ca/100000)
+        allowed_diff = ref_count // 100000  # floor(Ca / 100000)
 
-        # If ref is very short, allowed_diff might be 0 -> exact or within 0 edits
         max_diff = allowed_diff
+        if max_diff < 0:
+            return False
+
+        # Fast length-based rejection
+        if abs(len(ref_codons) - len(sub_codons)) > max_diff:
+            return False
 
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
         return dist <= allowed_diff
@@ -546,7 +576,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- DNA endpoints ----------
+    # ---------- DNA endpoints (with perf cache) ----------
 
     def handle_dna_submit(self):
         try:
@@ -577,8 +607,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # Register DNA; duplicate samples are fine (idempotent)
         samples = DNA_SAMPLES.setdefault(username, [])
+        codon_lists = DNA_SAMPLE_CODONS.setdefault(username, [])
+
         if dna_sample not in samples:
             samples.append(dna_sample)
+            # Pre-split and cache codons for this sample
+            codon_lists.append(self._split_codons(dna_sample))
             save_state()
 
         self._send_no_content(204)
@@ -613,10 +647,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
+        # Split submitted sample ONCE
+        submitted_codons = self._split_codons(dna_sample)
+
+        # Get (or build) cached codons for all user samples
+        ref_codons_list = self._get_user_dna_codons(username)
+
         # Compare against all reference samples
         matched = False
-        for ref in DNA_SAMPLES[username]:
-            if self._dna_matches(ref, dna_sample):
+        for ref_codons in ref_codons_list:
+            if self._dna_matches_codons(ref_codons, submitted_codons):
                 matched = True
                 break
 
@@ -1659,7 +1699,7 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        # For bulk operations, treat "order not found/inactive" as a validation error → 400
+        # For bulk operations, treat "order not found/inactive" as validation error → 400
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             return (False, None, 400)
 
@@ -1785,7 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        # For bulk operations, treat "order not found/inactive" as a validation error → 400
+        # For bulk operations, treat "order not found/inactive" as validation error → 400
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             return (False, None, 400)
 
