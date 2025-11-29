@@ -5,6 +5,12 @@ import uuid
 import time
 import base64
 import hashlib
+import os
+import json
+
+PERSIST_PATH = os.environ.get("PERSISTENT_DIR", ".")
+STATE_FILE = os.path.join(PERSIST_PATH, "exchange_state.json")
+
 
 USERS = {}
 TOKENS = {}
@@ -23,6 +29,49 @@ DNA_SAMPLES = {}
 
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
+
+def save_state():
+    state = {
+        "users": USERS,
+        "balances": BALANCES,
+        "collateral": COLLATERAL,
+        "dna_samples": DNA_SAMPLES,
+        "v2_orders": V2_ORDERS,
+        "trades": [t for t in TRADES if t.get("source") == "v2"],   # FIX
+    }
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print("Failed to save state:", e)
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+    except Exception:
+        return
+
+    USERS.clear()
+    USERS.update(state.get("users", {}))
+
+    BALANCES.clear()
+    BALANCES.update(state.get("balances", {}))
+
+    COLLATERAL.clear()
+    COLLATERAL.update(state.get("collateral", {}))
+
+    DNA_SAMPLES.clear()
+    DNA_SAMPLES.update(state.get("dna_samples", {}))
+
+    V2_ORDERS.clear()
+    V2_ORDERS.extend(state.get("v2_orders", []))
+
+    TRADES.clear()
+    TRADES.extend(state.get("trades", []))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -403,6 +452,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
+        save_state()
+
         self._send_no_content(204)
 
     def handle_login(self):
@@ -456,6 +507,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             USERS[username] = new_password
+            save_state()
             tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
@@ -498,6 +550,7 @@ class Handler(BaseHTTPRequestHandler):
         samples = DNA_SAMPLES.setdefault(username, [])
         if dna_sample not in samples:
             samples.append(dna_sample)
+            save_state()
 
         self._send_no_content(204)
 
@@ -841,7 +894,10 @@ class Handler(BaseHTTPRequestHandler):
                 "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
+            save_state()
+
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
+
             # Broadcast to stream subscribers
             self._broadcast_trade(trade)
 
@@ -868,6 +924,8 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "ACTIVE",
                     "created_at": now_ms,
                 })
+                save_state()
+
             else:
                 status = "FILLED"
         elif execution_type == "IOC":
@@ -1023,6 +1081,7 @@ class Handler(BaseHTTPRequestHandler):
                 "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
+            save_state()
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
             self._broadcast_trade(trade)
 
@@ -1066,6 +1125,8 @@ class Handler(BaseHTTPRequestHandler):
 
         order["status"] = "CANCELLED"
         order["quantity"] = 0
+        save_state()
+
 
         self._send_no_content(204)
 
@@ -1337,6 +1398,8 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
+        
+
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1374,6 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
+        save_state()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1400,9 +1464,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     # ---------- WebSocket trade stream endpoint ----------
-
     def handle_trades_stream(self):
-        # Basic WebSocket handshake (RFC 6455)
+        # --- Validate WebSocket handshake ---
         upgrade = (self.headers.get("Upgrade") or "").lower()
         connection = (self.headers.get("Connection") or "").lower()
         key = self.headers.get("Sec-WebSocket-Key")
@@ -1422,16 +1485,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
 
-        # Mark this handler as websocket so finish() doesn't close it
+        # Mark as websocket so finish() doesn't close it
         self._is_websocket = True
 
-        # Store the raw socket for broadcasting
-        TRADE_STREAM_CLIENTS.append(self.request)
-        # We don't read frames; stream is server -> client only.
-        # When the client disconnects, send will fail and we drop it.
+        sock = self.request
+        TRADE_STREAM_CLIENTS.append(sock)
+
+        # --- CRITICAL FIX ---
+        # Set socket to non-blocking so recv() doesn't freeze handler thread
+        sock.setblocking(False)
+
+        # Do ONE immediate non-blocking read to satisfy the HTTP handler,
+        # then RETURN so thread exits cleanly.
+        try:
+            sock.recv(1024)
+        except BlockingIOError:
+            pass
+        except Exception:
+            pass
+
+        # DO NOT LOOP HERE.
+        # Return now so BaseHTTPRequestHandler thread ends.
+        return
 
 
 def run():
+    load_state()
     server = HTTPServer(("", 8080), Handler)
     print("Server running on port 8080...")
     server.serve_forever()
