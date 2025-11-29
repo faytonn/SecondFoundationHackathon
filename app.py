@@ -22,8 +22,7 @@ COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 # New: DNA samples
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
-
-# Performance cache: username -> list[list[str]] pre-split codons
+# Performance cache: username -> list[list[str]] of codons per sample
 DNA_SAMPLE_CODONS = {}
 
 # WebSocket trade stream clients (raw sockets)
@@ -255,15 +254,12 @@ class Handler(BaseHTTPRequestHandler):
         samples = DNA_SAMPLES.get(username) or []
         cached = DNA_SAMPLE_CODONS.get(username)
 
+        # If cache missing or out of sync with stored strings, rebuild
         if cached is None or len(cached) != len(samples):
-            # (Re)build cache from stored strings
             cached = []
             for s in samples:
-                # Older state may have plain strings only
-                if isinstance(s, str):
-                    cached.append(self._split_codons(s))
-                else:
-                    cached.append(self._split_codons(str(s)))
+                s_str = s if isinstance(s, str) else str(s)
+                cached.append(self._split_codons(s_str))
             DNA_SAMPLE_CODONS[username] = cached
 
         return cached
@@ -280,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
         if max_diff < 0:
             return max_diff + 1
 
-        # At least this many insert/delete ops
+        # Length difference alone already exceeds limit → impossible
         if abs(n - m) > max_diff:
             return max_diff + 1
 
@@ -289,9 +285,9 @@ class Handler(BaseHTTPRequestHandler):
         if m == 0:
             return n
 
-        # prev and curr are dicts: j -> cost
+        # Banded DP: we only keep costs for j in [i - max_diff, i + max_diff]
         prev = {}
-        # row 0: cost = j (0..min(m, max_diff))
+        # row 0
         for j in range(0, min(m, max_diff) + 1):
             prev[j] = j
 
@@ -319,6 +315,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 curr[j] = min(ins, dele, sub)
 
+            # If even best value in this row already > max_diff, we can stop
             if min(curr.values()) > max_diff:
                 return max_diff + 1
 
@@ -330,19 +327,57 @@ class Handler(BaseHTTPRequestHandler):
     def _dna_matches_codons(self, ref_codons, sub_codons) -> bool:
         """
         Performance-oriented comparison using pre-split codon lists.
+
+        Key fast paths:
+          - length difference > allowed_diff → immediate reject
+          - allowed_diff == 0 → exact match only (no DP)
+          - long equal prefix/suffix are trimmed before DP
         """
-        ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000  # floor(Ca / 100000)
+        n = len(ref_codons)
+        m = len(sub_codons)
+
+        allowed_diff = n // 100000  # floor(Ca / 100000)
+
+        # If absolutely no edits allowed, require exact equality
+        if allowed_diff == 0:
+            if n != m:
+                return False
+            # For zero allowed edits, equal codon sequence means success
+            return ref_codons == sub_codons
 
         max_diff = allowed_diff
-        if max_diff < 0:
+
+        # Quick reject based on length difference
+        if abs(n - m) > max_diff:
             return False
 
-        # Fast length-based rejection
-        if abs(len(ref_codons) - len(sub_codons)) > max_diff:
+        # Trim common prefix
+        i0 = 0
+        j0 = 0
+        while i0 < n and j0 < m and ref_codons[i0] == sub_codons[j0]:
+            i0 += 1
+            j0 += 1
+
+        # Trim common suffix
+        i1 = n - 1
+        j1 = m - 1
+        while i1 >= i0 and j1 >= j0 and ref_codons[i1] == sub_codons[j1]:
+            i1 -= 1
+            j1 -= 1
+
+        # Remaining windows
+        if i0 > i1 and j0 > j1:
+            # Everything matched in prefix+suffix
+            return True
+
+        ref_mid = ref_codons[i0:i1+1]
+        sub_mid = sub_codons[j0:j1+1]
+
+        # Length difference after trimming still must be doable
+        if abs(len(ref_mid) - len(sub_mid)) > max_diff:
             return False
 
-        dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
+        dist = self._codon_edit_distance_bounded(ref_mid, sub_mid, max_diff)
         return dist <= allowed_diff
 
     # ---------- WebSocket helpers ----------
@@ -1537,7 +1572,7 @@ class Handler(BaseHTTPRequestHandler):
         return TOKENS.get(token)
 
     def _execute_create_operation(self, username: str, side: str, price: int, quantity: int,
-                                  delivery_start: int, delivery_end: int, execution_type: str = "GTC"):
+                                   delivery_start: int, delivery_end: int, execution_type: str = "GTC"):
         """Execute a create operation. Returns (success, result_dict, error_code)."""
         if side not in ("buy", "sell"):
             return (False, None, 400)
@@ -1699,9 +1734,8 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        # For bulk operations, treat "order not found/inactive" as validation error → 400
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
-            return (False, None, 400)
+            return (False, None, 404)
 
         if order.get("owner") != username:
             return (False, None, 403)
@@ -1825,9 +1859,8 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        # For bulk operations, treat "order not found/inactive" as validation error → 400
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
-            return (False, None, 400)
+            return (False, None, 404)
 
         if order.get("owner") != username:
             return (False, None, 403)
