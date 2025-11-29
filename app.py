@@ -293,19 +293,6 @@ class Handler(BaseHTTPRequestHandler):
         order_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
 
-        incoming = {
-            "order_id": order_id,
-            "side": side,
-            "owner": username,
-            "price": price,
-            "quantity": quantity,
-            "delivery_start": delivery_start,
-            "delivery_end": delivery_end,
-            "status": "ACTIVE",
-            "active": True,
-            "created_at": now_ms,
-        }
-
         remaining = quantity
         filled_quantity = 0
 
@@ -373,21 +360,27 @@ class Handler(BaseHTTPRequestHandler):
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
-                resting["status"] = "FILLED"
                 resting["active"] = False
 
-        incoming["quantity"] = remaining
-        if remaining <= 0:
-            incoming["status"] = "FILLED"
-            incoming["active"] = False
+        if remaining > 0:
+            status = "ACTIVE"
+            V2_ORDERS.append({
+                "order_id": order_id,
+                "side": side,
+                "owner": username,
+                "price": price,
+                "quantity": remaining,
+                "delivery_start": delivery_start,
+                "delivery_end": delivery_end,
+                "active": True,
+                "created_at": now_ms,
+            })
         else:
-            incoming["status"] = "ACTIVE"
-            incoming["active"] = True
-            V2_ORDERS.append(incoming)
+            status = "FILLED"
 
         self._send_gbuf(200, {
             "order_id": order_id,
-            "status": incoming["status"],
+            "status": status,
             "filled_quantity": filled_quantity,
         })
 
