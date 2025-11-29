@@ -1179,7 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def handle_order_book_stream(self):
+     def handle_order_book_stream(self):
         if self.command != "GET":
             self.send_response(405)
             self.end_headers()
@@ -1206,15 +1206,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         self._is_websocket = True
-
         sock = self.request
         ORDER_BOOK_STREAM_CLIENTS.append(sock)
 
+        # Start handling timeouts
         try:
             while True:
+                # Add a ping/pong mechanism to keep connection alive
+                sock.sendall(b"\x89\x00")  # Send a ping frame
                 data = sock.recv(1024)
                 if not data:
                     break
+                if data[0] == 0x8A:  # Pong response
+                    continue
         except Exception:
             pass
         finally:
@@ -1261,6 +1265,7 @@ class Handler(BaseHTTPRequestHandler):
         self._is_websocket = True
         sock = self.request
 
+        # Handle if the username is missing
         if not username:
             try:
                 frame = bytes([0x88, 0x02]) + (1008).to_bytes(2, "big")
@@ -1273,14 +1278,19 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
+        # Add the client to the Execution Reports stream list
         clients = EXECUTION_REPORT_CLIENTS.setdefault(username, [])
         clients.append(sock)
 
         try:
             while True:
+                # Ping/Pong to prevent timeouts
+                sock.sendall(b"\x89\x00")  # Send ping frame
                 data = sock.recv(1024)
                 if not data:
                     break
+                if data[0] == 0x8A:  # Pong response
+                    continue
         except Exception:
             pass
         finally:
