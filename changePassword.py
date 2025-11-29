@@ -11,45 +11,33 @@ import json
 USERS = {}
 TOKENS = {}
 
-ORDERS = []       # V1 orders (in-memory only, not persisted)
-V2_ORDERS = []    # V2 orders (persisted)
-TRADES = []       # All trades; V2 trades must persist, V1 can but don't have to
+ORDERS = []
+V2_ORDERS = []
+TRADES = []
 
-# balances are derived from V2 trades (recomputed on startup from persisted trades)
-BALANCES = {}     # username -> int
+BALANCES = {}
+COLLATERAL = {}
 
-# collateral limits (persisted)
-COLLATERAL = {}   # username -> collateral limit (None = unlimited)
-
-# DNA samples (persisted)
-# username -> list of registered DNA strings
 DNA_SAMPLES = {}
 
-# WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
-
-# ---------- persistence setup ----------
 
 PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
 STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_DIR else None
 
 
-def _rebuild_balances_from_trades():
-    """
-    Rebuild BALANCES from persisted trades.
-    We consider all trades (v1 + v2); v2 are required, v1 is fine to include.
-    """
+def _recompute_balances_from_trades():
     global BALANCES
     BALANCES = {}
     for t in TRADES:
-        try:
-            buyer = t.get("buyer_id")
-            seller = t.get("seller_id")
-            price = int(t.get("price", 0))
-            qty = int(t.get("quantity", 0))
-        except Exception:
+        if t.get("source") != "v2":
             continue
-        if not buyer or not seller:
+        try:
+            buyer = t["buyer_id"]
+            seller = t["seller_id"]
+            price = int(t["price"])
+            qty = int(t["quantity"])
+        except Exception:
             continue
         amount = price * qty
         BALANCES[buyer] = BALANCES.get(buyer, 0) - amount
@@ -57,72 +45,53 @@ def _rebuild_balances_from_trades():
 
 
 def _load_state():
-    """
-    Load persisted exchange state (users, v2 orders, trades, collateral, dna).
-    V1 orders are intentionally not persisted.
-    """
-    global USERS, V2_ORDERS, TRADES, COLLATERAL, DNA_SAMPLES
-    if not STATE_FILE:
+    global USERS, COLLATERAL, DNA_SAMPLES, V2_ORDERS, TRADES
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
         return
     try:
-        if not os.path.exists(STATE_FILE):
-            return
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
     except Exception:
         return
 
-    USERS = data.get("users", {}) or {}
-    V2_ORDERS = data.get("v2_orders", []) or []
-    TRADES[:] = data.get("trades", []) or []
-    COLLATERAL.clear()
-    COLLATERAL.update(data.get("collateral", {}) or {})
-    DNA_SAMPLES.clear()
-    DNA_SAMPLES.update(data.get("dna_samples", {}) or {})
+    USERS = state.get("users", {})
+    COLLATERAL = state.get("collateral", {})
+    DNA_SAMPLES = state.get("dna_samples", {})
+    V2_ORDERS = state.get("v2_orders", [])
+    TRADES.clear()
+    TRADES.extend(state.get("trades", []))
 
-    _rebuild_balances_from_trades()
+    _recompute_balances_from_trades()
 
 
 def _save_state():
-    """
-    Persist users, v2 orders, trades, collateral, dna samples.
-    Best-effort: failures are ignored.
-    """
-    if not STATE_FILE or not PERSISTENT_DIR:
+    if not STATE_FILE:
         return
-    data = {
-        "users": USERS,
-        "v2_orders": V2_ORDERS,
-        "trades": TRADES,
-        "collateral": COLLATERAL,
-        "dna_samples": DNA_SAMPLES,
-    }
-    tmp_path = STATE_FILE + ".tmp"
     try:
-        os.makedirs(PERSISTENT_DIR, exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp_path, STATE_FILE)
+        if PERSISTENT_DIR and not os.path.isdir(PERSISTENT_DIR):
+            os.makedirs(PERSISTENT_DIR, exist_ok=True)
+
+        state = {
+            "users": USERS,
+            "collateral": COLLATERAL,
+            "dna_samples": DNA_SAMPLES,
+            "v2_orders": V2_ORDERS,
+            "trades": [t for t in TRADES if t.get("source") == "v2"],
+        }
+
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
     except Exception:
-        # Best-effort persistence
         pass
 
 
 class Handler(BaseHTTPRequestHandler):
-    # ---------- helpers ----------
-
     def _check_trading_window(self, delivery_start: int):
-        """
-        Returns:
-            True  - inside trading window
-            False - already responded with 425/451
-        """
-
         now_ms = int(time.time() * 1000)
-
-        OPEN_MS = 15 * 24 * 60 * 60 * 1000     # 15 days
-        CLOSE_MS = 60 * 1000                   # 1 min
-
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000
+        CLOSE_MS = 60 * 1000
         open_time = delivery_start - OPEN_MS
         close_time = delivery_start - CLOSE_MS
 
@@ -168,28 +137,14 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return TOKENS.get(token)
 
-    # ----- balances / collateral helpers -----
-
     def _apply_trade_balances(self, buyer_id: str, seller_id: str, price: int, quantity: int):
-        """
-        Buyer pays price * quantity, seller receives price * quantity.
-        Negative prices will naturally invert the effect.
-        """
         amount = int(price) * int(quantity)
         BALANCES[buyer_id] = BALANCES.get(buyer_id, 0) - amount
         BALANCES[seller_id] = BALANCES.get(seller_id, 0) + amount
 
     def _compute_potential_balance(self, username: str) -> int:
-        """
-        Potential balance = current balance + effect if all ACTIVE orders fill.
-
-        Includes:
-          - V1 ORDERS (always sells at positive price)
-          - V2_ORDERS (buys/sells with side)
-        """
         balance = BALANCES.get(username, 0)
 
-        # --- V1 orders: always sells made by seller_id ---
         for o in ORDERS:
             if not o.get("active", True):
                 continue
@@ -202,10 +157,8 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if qty <= 0:
                 continue
-            # V1 is always sell at positive price -> user receives price * qty
             balance += price * qty
 
-        # --- V2 orders: buys and sells ---
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
@@ -221,15 +174,11 @@ class Handler(BaseHTTPRequestHandler):
 
             side = o.get("side")
             if side == "buy":
-                # Buy: user pays price * qty
                 balance -= price * qty
             elif side == "sell":
-                # Sell: user receives price * qty
                 balance += price * qty
 
         return balance
-
-    # ---------- DNA helpers ----------
 
     def _validate_dna_sample(self, dna: str) -> bool:
         if not dna:
@@ -245,18 +194,12 @@ class Handler(BaseHTTPRequestHandler):
         return [dna[i:i+3] for i in range(0, len(dna), 3)]
 
     def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
-        """
-        Levenshtein distance on codons with a hard cap max_diff.
-        Returns a value > max_diff if distance exceeds max_diff.
-        Uses a banded DP of width ~2*max_diff+1.
-        """
         n = len(ref_codons)
         m = len(sample_codons)
 
         if max_diff < 0:
             return max_diff + 1
 
-        # At least this many insert/delete ops
         if abs(n - m) > max_diff:
             return max_diff + 1
 
@@ -265,9 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         if m == 0:
             return n
 
-        # prev and curr are dicts: j -> cost
         prev = {}
-        # row 0: cost = j (0..min(m, max_diff))
         for j in range(0, min(m, max_diff) + 1):
             prev[j] = j
 
@@ -277,16 +218,13 @@ class Handler(BaseHTTPRequestHandler):
             curr = {}
 
             for j in range(j_min, j_max + 1):
-                # insertion: (i, j-1) -> (i, j)
                 if j > j_min:
                     ins = curr[j - 1] + 1
                 else:
-                    ins = max_diff + 1  # out of band
+                    ins = max_diff + 1
 
-                # deletion: (i-1, j) -> (i, j)
                 dele = prev.get(j, max_diff + 1) + 1
 
-                # substitution / match: (i-1, j-1) -> (i, j)
                 if j - 1 in prev:
                     sub_cost = 0 if ref_codons[i - 1] == sample_codons[j - 1] else 1
                     sub = prev[j - 1] + sub_cost
@@ -306,19 +244,14 @@ class Handler(BaseHTTPRequestHandler):
     def _dna_matches(self, reference: str, submitted: str) -> bool:
         ref_codons = self._split_codons(reference)
         sub_codons = self._split_codons(submitted)
-
         ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000  # floor(Ca/100000)
-
+        allowed_diff = ref_count // 100000
         max_diff = allowed_diff
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
         return dist <= allowed_diff
 
-    # ---------- WebSocket helpers ----------
-
     def _ws_build_binary_frame(self, payload: bytes) -> bytes:
-        # Server-to-client frames are not masked.
-        fin_opcode = 0x82  # FIN=1, opcode=2 (binary)
+        fin_opcode = 0x82
         length = len(payload)
         if length < 126:
             header = bytes([fin_opcode, length])
@@ -329,7 +262,6 @@ class Handler(BaseHTTPRequestHandler):
         return header + payload
 
     def _broadcast_trade(self, trade: dict):
-        # Only V2 trades should be broadcast; caller ensures this via "source": "v2".
         if not TRADE_STREAM_CLIENTS:
             return
         payload = encode_message({
@@ -344,7 +276,6 @@ class Handler(BaseHTTPRequestHandler):
         })
         frame = self._ws_build_binary_frame(payload)
 
-        # Send to all connected clients, drop broken ones
         for sock in list(TRADE_STREAM_CLIENTS):
             try:
                 sock.sendall(frame)
@@ -353,8 +284,6 @@ class Handler(BaseHTTPRequestHandler):
                     TRADE_STREAM_CLIENTS.remove(sock)
                 except ValueError:
                     pass
-
-    # ---------- HTTP methods ----------
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -386,7 +315,6 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # public V2 trades endpoint
             self.handle_v2_trades(parsed)
 
         elif parsed.path == "/v2/stream/trades":
@@ -408,7 +336,6 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            # Not implemented yet
             self.send_response(501)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -443,7 +370,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    # Override finish so WebSocket connections stay open
     def finish(self):
         try:
             if not self.wfile.closed:
@@ -451,7 +377,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         if getattr(self, "_is_websocket", False):
-            # Do not close socket for WebSocket connections
             return
         try:
             self.wfile.close()
@@ -461,8 +386,6 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.close()
         except Exception:
             pass
-
-    # ---------- auth & users ----------
 
     def handle_register(self):
         try:
@@ -548,8 +471,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- DNA endpoints ----------
-
     def handle_dna_submit(self):
         try:
             raw = self._read_body()
@@ -562,22 +483,18 @@ class Handler(BaseHTTPRequestHandler):
         password = (data.get("password") or "").strip()
         dna_sample = (data.get("dna_sample") or "").strip()
 
-        # Validate input presence
         if not username or not password or not dna_sample:
             self._send_no_content(400)
             return
 
-        # Check credentials (username/password)
         if USERS.get(username) != password:
             self._send_no_content(401)
             return
 
-        # Validate DNA format
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Register DNA; duplicate samples are fine (idempotent)
         samples = DNA_SAMPLES.setdefault(username, [])
         if dna_sample not in samples:
             samples.append(dna_sample)
@@ -596,12 +513,10 @@ class Handler(BaseHTTPRequestHandler):
         username = (data.get("username") or "").strip()
         dna_sample = (data.get("dna_sample") or "").strip()
 
-        # Validate input presence
         if not username or not dna_sample:
             self._send_no_content(400)
             return
 
-        # User must exist and have DNA registered
         if username not in USERS:
             self._send_no_content(401)
             return
@@ -610,12 +525,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Validate DNA format
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Compare against all reference samples
         matched = False
         for ref in DNA_SAMPLES[username]:
             if self._dna_matches(ref, dna_sample):
@@ -626,13 +539,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Success → issue token just like /login
         token = uuid.uuid4().hex
         TOKENS[token] = username
 
         self._send_gbuf(200, {"token": token})
-
-    # ---------- V1 orders & trades ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -717,13 +627,10 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"order_id": order_id})
 
-    # ---------- collateral checks ----------
-
     def _check_collateral_create(self, username: str, side: str, price: int, quantity: int) -> bool:
         coll = COLLATERAL.get(username)
         if coll is None:
-            return True  # unlimited
-        # Only check orders that can reduce balance
+            return True
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
         base = self._compute_potential_balance(username)
@@ -739,7 +646,6 @@ class Handler(BaseHTTPRequestHandler):
         if coll is None:
             return True
 
-        # Recompute potential balance assuming the target order has (new_price, new_quantity)
         base = BALANCES.get(username, 0)
         side_for_target = None
 
@@ -766,15 +672,12 @@ class Handler(BaseHTTPRequestHandler):
                 base += price * qty
 
         if side_for_target is None:
-            # Order not found as active – let other logic handle 404
             return True
 
         if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
             return True
 
         return base >= -coll
-
-    # ---------- V2 submit (matching engine + IOC/FOK) ----------
 
     def handle_submit_order_v2(self):
         username = self._get_authenticated_user()
@@ -826,7 +729,6 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_trading_window(delivery_start):
             return
 
-        # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -839,7 +741,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
-        # Build candidate list on opposite side
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -850,9 +751,8 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
-            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
+        else:
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -862,16 +762,13 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
-            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match prevention BEFORE any trades / book changes
         for resting in candidates:
             if resting.get("owner") == username:
                 self._send_no_content(412)
                 return
 
-        # FOK: dry-run to see if full quantity can be filled immediately
         if execution_type == "FOK":
             total_possible = 0
             for resting in candidates:
@@ -882,7 +779,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
             if total_possible < quantity:
-                # Cannot fully fill -> cancel, no trades, no book entry
                 self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
@@ -890,7 +786,6 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-        # Matching loop (used by all types once we've passed FOK dry-run)
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -909,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]  # maker price
+            trade_price = resting["price"]
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -922,11 +817,10 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
-            # Broadcast to stream subscribers
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
@@ -937,7 +831,6 @@ class Handler(BaseHTTPRequestHandler):
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
-        # Decide final status and whether order goes into book
         if execution_type == "GTC":
             if remaining > 0:
                 status = "ACTIVE"
@@ -955,20 +848,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 status = "FILLED"
         elif execution_type == "IOC":
-            # Never go into book; remaining is cancelled
             status = "FILLED" if remaining <= 0 else "CANCELLED"
-        else:  # FOK
-            # We already ensured via dry-run that we can fully fill
+        else:
             status = "FILLED"
 
         _save_state()
+
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
             "filled_quantity": filled_quantity,
         })
-
-    # ---------- V2 modify / cancel ----------
 
     def handle_modify_order(self, order_id: str):
         username = self._get_authenticated_user()
@@ -1016,7 +906,6 @@ class Handler(BaseHTTPRequestHandler):
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
-        # Self-match prevention: compute candidates with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -1047,7 +936,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(412)
                 return
 
-        # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -1057,7 +945,6 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
-        # Apply modifications
         order["price"] = new_price
         order["quantity"] = new_quantity
 
@@ -1068,7 +955,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = order["quantity"]
         filled_quantity = 0
 
-        # Matching loop using precomputed candidates
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -1104,7 +990,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -1123,6 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
             order["status"] = "FILLED"
 
         _save_state()
+
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -1153,9 +1040,8 @@ class Handler(BaseHTTPRequestHandler):
         order["quantity"] = 0
 
         _save_state()
-        self._send_no_content(204)
 
-    # ---------- V2 order book / my-orders / my-trades ----------
+        self._send_no_content(204)
 
     def handle_v2_order_book(self, parsed):
         qs = parse_qs(parsed.query)
@@ -1178,7 +1064,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Trading window: outside window → empty orderbook
         OPEN_MS = 15 * 24 * 60 * 60 * 1000
         CLOSE_MS = 60 * 1000
         now_ms = int(time.time() * 1000)
@@ -1211,9 +1096,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
-        # Bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
-        # Asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -1307,8 +1190,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (global, V1+V2) ----------
-
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
 
@@ -1324,8 +1205,6 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"trades": trades_payload})
-
-    # ---------- public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
@@ -1348,7 +1227,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Filter only V2 trades for the given contract
         v2_trades = [
             t for t in TRADES
             if t.get("source") == "v2"
@@ -1372,8 +1250,6 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"trades": trades_payload})
-
-    # ---------- V1 take order (creates trades, updates balance) ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -1417,19 +1293,15 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
-            "source": "v1",  # mark as V1 trade
+            "source": "v1",
         }
         TRADES.append(trade)
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
-        _save_state()
 
         self._send_gbuf(200, {"trade_id": trade_id})
 
-    # ---------- collateral endpoints ----------
-
     def handle_set_collateral(self, username: str):
-        # Admin-only: Authorization: Bearer password123
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             self._send_no_content(401)
@@ -1478,8 +1350,7 @@ class Handler(BaseHTTPRequestHandler):
         potential = self._compute_potential_balance(username)
         collateral = COLLATERAL.get(username)
         if collateral is None:
-            # unlimited collateral – represent as a very large int
-            collateral = 9223372036854775807  # 2^63 - 1
+            collateral = 9223372036854775807
 
         self._send_gbuf(200, {
             "balance": int(balance),
@@ -1487,10 +1358,7 @@ class Handler(BaseHTTPRequestHandler):
             "collateral": int(collateral),
         })
 
-    # ---------- WebSocket trade stream endpoint ----------
-
     def handle_trades_stream(self):
-        # Basic WebSocket handshake (RFC 6455)
         upgrade = (self.headers.get("Upgrade") or "").lower()
         connection = (self.headers.get("Connection") or "").lower()
         key = self.headers.get("Sec-WebSocket-Key")
@@ -1510,13 +1378,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
 
-        # Mark this handler as websocket so finish() doesn't close it
         self._is_websocket = True
 
-        # Store the raw socket for broadcasting
         TRADE_STREAM_CLIENTS.append(self.request)
-        # We don't read frames; stream is server -> client only.
-        # When the client disconnects, send will fail and we drop it.
 
 
 def run():
