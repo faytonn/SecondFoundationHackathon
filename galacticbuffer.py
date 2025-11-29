@@ -1,0 +1,293 @@
+import struct
+
+TYPE_INT = 0x01
+TYPE_STRING = 0x02
+TYPE_LIST = 0x03
+TYPE_OBJECT = 0x04
+
+# ---------- ENCODING ----------
+
+def _encode_int(value: int) -> bytes:
+    return struct.pack(">q", value)  # 64-bit signed, big-endian
+
+def _encode_string(value: str) -> bytes:
+    data = value.encode("utf-8")
+    if len(data) > 0xFFFF:
+        raise ValueError("string too long")
+    return struct.pack(">H", len(data)) + data
+
+def _encode_object(obj: dict) -> bytes:
+    """
+    Encodes an object (type 0x04 value):
+    [field_count][field1][field2]...[fieldN]
+    Fields use the same [name_len][name][type][value] format as top-level.
+    """
+    field_bytes = bytearray()
+    field_count = 0
+
+    for name, value in obj.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length in object")
+
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
+
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += _encode_int(value)
+
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string(value)
+
+        else:
+            # For now we only expect ints/strings inside order objects
+            raise NotImplementedError(f"unsupported object field type for {name!r}")
+
+        field_count += 1
+
+    if field_count > 255:
+        raise ValueError("too many fields in object")
+
+    return bytes([field_count]) + field_bytes
+
+def _encode_list(values, elem_type: int) -> bytes:
+    if len(values) > 0xFFFF:
+        raise ValueError("too many list elements")
+
+    out = bytearray()
+    out.append(elem_type)                      # element type
+    out += struct.pack(">H", len(values))     # element count
+
+    if elem_type == TYPE_INT:
+        for v in values:
+            out += _encode_int(v)
+    elif elem_type == TYPE_STRING:
+        for v in values:
+            out += _encode_string(v)
+    elif elem_type == TYPE_OBJECT:
+        for v in values:
+            if not isinstance(v, dict):
+                raise ValueError("list with object type but non-dict value")
+            out += _encode_object(v)
+    else:
+        raise NotImplementedError("unsupported list element type")
+
+    return bytes(out)
+
+def encode_message(fields: dict) -> bytes:
+    """
+    fields: dict like:
+      {
+        "user_id": 1001,
+        "name": "Alice",
+        "scores": [100, 200, 300],
+        "orders": [ { ... }, { ... } ]
+      }
+    """
+    field_bytes = bytearray()
+
+    for name, value in fields.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length")
+
+        # field name length + name
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
+
+        # type + value
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += _encode_int(value)
+
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string(value)
+
+        elif isinstance(value, list):
+            if all(isinstance(v, int) for v in value):
+                field_bytes.append(TYPE_LIST)
+                field_bytes += _encode_list(value, TYPE_INT)
+            elif all(isinstance(v, str) for v in value):
+                field_bytes.append(TYPE_LIST)
+                field_bytes += _encode_list(value, TYPE_STRING)
+            elif all(isinstance(v, dict) for v in value):
+                field_bytes.append(TYPE_LIST)
+                field_bytes += _encode_list(value, TYPE_OBJECT)
+            else:
+                raise NotImplementedError("mixed-type lists not supported")
+
+        elif isinstance(value, dict):
+            # single nested object
+            field_bytes.append(TYPE_OBJECT)
+            field_bytes += _encode_object(value)
+
+        else:
+            raise NotImplementedError(f"unsupported type for field {name!r}: {type(value)}")
+
+    version = 0x01
+    field_count = len(fields)
+    total_length = 4 + len(field_bytes)
+    if total_length > 0xFFFF:
+        raise ValueError("message too big")
+
+    header = struct.pack(">BBH", version, field_count, total_length)
+    return header + field_bytes
+
+# ---------- DECODING ----------
+
+def _decode_object(data: bytes, offset: int):
+    """
+    Decode an object value (type 0x04) starting at data[offset].
+    Returns (obj_dict, new_offset).
+    """
+    if offset >= len(data):
+        raise ValueError("truncated object (field count)")
+
+    field_count = data[offset]
+    offset += 1
+
+    obj = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated object (field name len)")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated object (field name)")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated object (type id)")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated object int")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+        elif type_id == TYPE_STRING:
+            if offset + 2 > len(data):
+                raise ValueError("truncated object string len")
+            str_len = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+            if offset + str_len > len(data):
+                raise ValueError("truncated object string data")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+        else:
+            raise NotImplementedError("objects with nested lists/objects not implemented")
+
+        obj[name] = value
+
+    return obj, offset
+
+def decode_message(data: bytes) -> dict:
+    if len(data) < 4:
+        raise ValueError("message too short")
+
+    version, field_count, total_len = struct.unpack(">BBH", data[:4])
+    if version != 0x01:
+        raise ValueError(f"unsupported version {version}")
+
+    offset = 4
+    result = {}
+
+    for _ in range(field_count):
+        if offset >= len(data):
+            raise ValueError("truncated message (field name length)")
+
+        name_len = data[offset]
+        offset += 1
+
+        if offset + name_len > len(data):
+            raise ValueError("truncated message (field name)")
+
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        if offset >= len(data):
+            raise ValueError("truncated message (type id)")
+
+        type_id = data[offset]
+        offset += 1
+
+        if type_id == TYPE_INT:
+            if offset + 8 > len(data):
+                raise ValueError("truncated int value")
+            value = struct.unpack(">q", data[offset:offset + 8])[0]
+            offset += 8
+
+        elif type_id == TYPE_STRING:
+            if offset + 2 > len(data):
+                raise ValueError("truncated string length")
+            str_len = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+            if offset + str_len > len(data):
+                raise ValueError("truncated string data")
+            value = data[offset:offset + str_len].decode("utf-8")
+            offset += str_len
+
+        elif type_id == TYPE_LIST:
+            if offset + 3 > len(data):
+                raise ValueError("truncated list header")
+            elem_type = data[offset]
+            offset += 1
+            count = struct.unpack(">H", data[offset:offset + 2])[0]
+            offset += 2
+
+            items = []
+            if elem_type == TYPE_INT:
+                for _ in range(count):
+                    if offset + 8 > len(data):
+                        raise ValueError("truncated list int")
+                    items.append(struct.unpack(">q", data[offset:offset + 8])[0])
+                    offset += 8
+            elif elem_type == TYPE_STRING:
+                for _ in range(count):
+                    if offset + 2 > len(data):
+                        raise ValueError("truncated list string len")
+                    sl = struct.unpack(">H", data[offset:offset + 2])[0]
+                    offset += 2
+                    if offset + sl > len(data):
+                        raise ValueError("truncated list string data")
+                    items.append(data[offset:offset + sl].decode("utf-8"))
+                    offset += sl
+            elif elem_type == TYPE_OBJECT:
+                for _ in range(count):
+                    obj, offset = _decode_object(data, offset)
+                    items.append(obj)
+            else:
+                raise NotImplementedError("list element type not implemented")
+
+            value = items
+
+        elif type_id == TYPE_OBJECT:
+            obj, offset = _decode_object(data, offset)
+            value = obj
+
+        else:
+            raise NotImplementedError(f"type id {type_id} not implemented yet")
+
+        result[name] = value
+
+    return result
+
+
+if __name__ == "__main__":
+    msg = encode_message({
+        "user_id": 1001,
+        "name": "Alice",
+        "scores": [100, 200, 300],
+    })
+    print(len(msg), msg.hex())
+    print(decode_message(msg))
