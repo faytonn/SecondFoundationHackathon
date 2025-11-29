@@ -3,6 +3,8 @@ from urllib.parse import urlparse, parse_qs
 from galacticbuffer import encode_message, decode_message
 import uuid
 import time
+import base64
+import hashlib
 
 USERS = {}
 TOKENS = {}
@@ -18,6 +20,9 @@ COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 # New: DNA samples
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
+
+# WebSocket trade stream clients (raw sockets)
+TRADE_STREAM_CLIENTS = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -228,6 +233,46 @@ class Handler(BaseHTTPRequestHandler):
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
         return dist <= allowed_diff
 
+    # ---------- WebSocket helpers ----------
+
+    def _ws_build_binary_frame(self, payload: bytes) -> bytes:
+        # Server-to-client frames are not masked.
+        fin_opcode = 0x82  # FIN=1, opcode=2 (binary)
+        length = len(payload)
+        if length < 126:
+            header = bytes([fin_opcode, length])
+        elif length < (1 << 16):
+            header = bytes([fin_opcode, 126]) + length.to_bytes(2, "big")
+        else:
+            header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
+        return header + payload
+
+    def _broadcast_trade(self, trade: dict):
+        # Only V2 trades should be broadcast; caller ensures this
+        if not TRADE_STREAM_CLIENTS:
+            return
+        payload = encode_message({
+            "trade_id": str(trade["trade_id"]),
+            "buyer_id": str(trade["buyer_id"]),
+            "seller_id": str(trade["seller_id"]),
+            "price": int(trade["price"]),
+            "quantity": int(trade["quantity"]),
+            "delivery_start": int(trade["delivery_start"]),
+            "delivery_end": int(trade["delivery_end"]),
+            "timestamp": int(trade["timestamp"]),
+        })
+        frame = self._ws_build_binary_frame(payload)
+
+        # Send to all connected clients, drop broken ones
+        for sock in list(TRADE_STREAM_CLIENTS):
+            try:
+                sock.sendall(frame)
+            except Exception:
+                try:
+                    TRADE_STREAM_CLIENTS.remove(sock)
+                except ValueError:
+                    pass
+
     # ---------- HTTP methods ----------
 
     def do_GET(self):
@@ -262,6 +307,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/v2/trades":
             # NEW: public V2 trades endpoint
             self.handle_v2_trades(parsed)
+
+        elif parsed.path == "/v2/stream/trades":
+            self.handle_trades_stream()
 
         else:
             self.send_response(404)
@@ -313,6 +361,25 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    # Override finish so WebSocket connections stay open
+    def finish(self):
+        try:
+            if not self.wfile.closed:
+                self.wfile.flush()
+        except Exception:
+            pass
+        if getattr(self, "_is_websocket", False):
+            # Do not close socket for WebSocket connections
+            return
+        try:
+            self.wfile.close()
+        except Exception:
+            pass
+        try:
+            self.rfile.close()
+        except Exception:
+            pass
 
     # ---------- auth & users ----------
 
@@ -623,7 +690,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return base >= -coll
 
-    # ---------- V2 submit (matching engine) ----------
+    # ---------- V2 submit (matching engine + IOC/FOK) ----------
 
     def handle_submit_order_v2(self):
         username = self._get_authenticated_user()
@@ -639,6 +706,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         side = (data.get("side") or "").strip()
+        execution_type = (data.get("execution_type") or "GTC").strip() or "GTC"
+        if execution_type not in ("GTC", "IOC", "FOK"):
+            self._send_no_content(400)
+            return
+
         try:
             price = int(data.get("price"))
             quantity = int(data.get("quantity"))
@@ -715,7 +787,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(412)
                 return
 
-        # Matching loop
+        # FOK: dry-run to see if full quantity can be filled immediately
+        if execution_type == "FOK":
+            total_possible = 0
+            for resting in candidates:
+                if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
+                    continue
+                total_possible += resting["quantity"]
+                if total_possible >= quantity:
+                    break
+
+            if total_possible < quantity:
+                # Cannot fully fill -> cancel, no trades, no book entry
+                self._send_gbuf(200, {
+                    "order_id": order_id,
+                    "status": "CANCELLED",
+                    "filled_quantity": 0,
+                })
+                return
+
+        # Matching loop (used by all types once we've passed FOK dry-run)
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -751,6 +842,8 @@ class Handler(BaseHTTPRequestHandler):
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
+            # Broadcast to stream subscribers
+            self._broadcast_trade(trade)
 
             remaining -= trade_qty
             filled_quantity += trade_qty
@@ -760,20 +853,29 @@ class Handler(BaseHTTPRequestHandler):
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
-        if remaining > 0:
-            status = "ACTIVE"
-            V2_ORDERS.append({
-                "order_id": order_id,
-                "side": side,
-                "owner": username,
-                "price": price,
-                "quantity": remaining,
-                "delivery_start": delivery_start,
-                "delivery_end": delivery_end,
-                "status": "ACTIVE",
-                "created_at": now_ms,
-            })
-        else:
+        # Decide final status and whether order goes into book
+        if execution_type == "GTC":
+            if remaining > 0:
+                status = "ACTIVE"
+                V2_ORDERS.append({
+                    "order_id": order_id,
+                    "side": side,
+                    "owner": username,
+                    "price": price,
+                    "quantity": remaining,
+                    "delivery_start": delivery_start,
+                    "delivery_end": delivery_end,
+                    "status": "ACTIVE",
+                    "created_at": now_ms,
+                })
+            else:
+                status = "FILLED"
+        elif execution_type == "IOC":
+            # Never go into book; remaining is cancelled
+            status = "FILLED" if remaining <= 0 else "CANCELLED"
+        else:  # FOK
+            # We already ensured via dry-run that we can fully fill
+            # so remaining should be 0 here.
             status = "FILLED"
 
         self._send_gbuf(200, {
@@ -922,6 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
+            self._broadcast_trade(trade)
 
             remaining -= trade_qty
             filled_quantity += trade_qty
@@ -1295,6 +1398,37 @@ class Handler(BaseHTTPRequestHandler):
             "potential_balance": int(potential),
             "collateral": int(collateral),
         })
+
+    # ---------- WebSocket trade stream endpoint ----------
+
+    def handle_trades_stream(self):
+        # Basic WebSocket handshake (RFC 6455)
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        connection = (self.headers.get("Connection") or "").lower()
+        key = self.headers.get("Sec-WebSocket-Key")
+
+        if upgrade != "websocket" or "upgrade" not in connection or not key:
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        accept_src = (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        accept = base64.b64encode(hashlib.sha1(accept_src).digest()).decode("ascii")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        # Mark this handler as websocket so finish() doesn't close it
+        self._is_websocket = True
+
+        # Store the raw socket for broadcasting
+        TRADE_STREAM_CLIENTS.append(self.request)
+        # We don't read frames; stream is server -> client only.
+        # When the client disconnects, send will fail and we drop it.
 
 
 def run():
