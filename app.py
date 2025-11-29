@@ -15,9 +15,6 @@ TRADES = []
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
-# New: DNA samples: username -> list of normalized DNA strings
-DNA_SAMPLES = {}
-
 
 class Handler(BaseHTTPRequestHandler):
     # ---------- helpers ----------
@@ -63,91 +60,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def _compute_potential_balance(self, username: str) -> int:
         """
-        Potential balance = current balance + effect if all ACTIVE V2 orders fill.
-        Buy -> pays price * qty (subtract)
-        Sell -> receives price * qty (add)
+        Potential balance = current balance + effect if all ACTIVE orders fill.
+
+        Includes:
+          - V1 ORDERS (always sells at positive price)
+          - V2_ORDERS (buys/sells with side)
         """
         balance = BALANCES.get(username, 0)
+
+        # --- V1 orders: always sells made by seller_id ---
+        for o in ORDERS:
+            if not o.get("active", True):
+                continue
+            if o.get("seller_id") != username:
+                continue
+            try:
+                qty = int(o.get("quantity", 0))
+                price = int(o.get("price", 0))
+            except Exception:
+                continue
+            if qty <= 0:
+                continue
+            # V1 is always sell at positive price -> user receives price * qty
+            balance += price * qty
+
+        # --- V2 orders: buys and sells ---
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
             if o.get("status") != "ACTIVE":
                 continue
-            qty = int(o.get("quantity", 0))
+            try:
+                qty = int(o.get("quantity", 0))
+                price = int(o.get("price", 0))
+            except Exception:
+                continue
             if qty <= 0:
                 continue
-            price = int(o["price"])
-            if o["side"] == "buy":
+
+            side = o.get("side")
+            if side == "buy":
+                # Buy: user pays price * qty
                 balance -= price * qty
-            else:
+            elif side == "sell":
+                # Sell: user receives price * qty
                 balance += price * qty
+
         return balance
-
-    # ---------- DNA helpers ----------
-
-    def _normalize_and_validate_dna(self, dna: str):
-        """
-        Strip + uppercase, ensure only C/G/A/T and length divisible by 3.
-        Return normalized DNA string or None if invalid.
-        """
-        s = (dna or "").strip().upper()
-        if not s:
-            return None
-        if len(s) % 3 != 0:
-            return None
-        for ch in s:
-            if ch not in ("C", "G", "A", "T"):
-                return None
-        return s
-
-    def _codon_distance(self, ref: str, sample: str, max_diff: int) -> int:
-        """
-        Levenshtein distance on codon sequences (3-char chunks).
-        Operations: insert, delete, substitute codons.
-        Early-stops if distance exceeds max_diff.
-        """
-        ref_codons = [ref[i:i+3] for i in range(0, len(ref), 3)]
-        sam_codons = [sample[i:i+3] for i in range(0, len(sample), 3)]
-
-        n = len(ref_codons)
-        m = len(sam_codons)
-
-        # Quick lower bound
-        if abs(n - m) > max_diff:
-            return max_diff + 1
-
-        # Standard Levenshtein DP with early cutoff
-        prev = list(range(m + 1))
-        curr = [0] * (m + 1)
-
-        for i in range(1, n + 1):
-            curr[0] = i
-            row_min = curr[0]
-            rc = ref_codons[i - 1]
-            for j in range(1, m + 1):
-                sc = sam_codons[j - 1]
-                cost = 0 if rc == sc else 1
-
-                deletion = prev[j] + 1
-                insertion = curr[j - 1] + 1
-                substitution = prev[j - 1] + cost
-
-                v = deletion
-                if insertion < v:
-                    v = insertion
-                if substitution < v:
-                    v = substitution
-                curr[j] = v
-
-                if v < row_min:
-                    row_min = v
-
-            if row_min > max_diff:
-                return max_diff + 1
-
-            prev, curr = curr, prev
-
-        return prev[m]
 
     # ---------- HTTP methods ----------
 
@@ -196,14 +155,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            # Not implemented yet
+            # You can implement this later – for now just not implemented.
             self.send_response(501)
             self.send_header("Content-Length", "0")
             self.end_headers()
-        elif self.path == "/dna-submit":
-            self.handle_dna_submit()
-        elif self.path == "/dna-login":
-            self.handle_dna_login()
         else:
             self.send_response(404)
             self.end_headers()
@@ -315,107 +270,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- DNA-based logins ----------
-
-    def handle_dna_submit(self):
-        """
-        POST /dna-submit
-        Request (v2 GalacticBuf):
-          username (string)
-          password (string)
-          dna_sample (string, CGAT*, len%3==0)
-        """
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        username = (data.get("username") or "").strip()
-        password = (data.get("password") or "").strip()
-        dna_sample_raw = data.get("dna_sample") or ""
-
-        if not username or not password or not dna_sample_raw:
-            self._send_no_content(400)
-            return
-
-        # Verify user + password
-        stored_pw = USERS.get(username)
-        if stored_pw is None or stored_pw != password:
-            self._send_no_content(401)
-            return
-
-        dna = self._normalize_and_validate_dna(dna_sample_raw)
-        if dna is None:
-            self._send_no_content(400)
-            return
-
-        samples = DNA_SAMPLES.get(username)
-        if samples is None:
-            DNA_SAMPLES[username] = [dna]
-        else:
-            if dna not in samples:
-                samples.append(dna)
-
-        self._send_no_content(204)
-
-    def handle_dna_login(self):
-        """
-        POST /dna-login
-        Request (v2 GalacticBuf):
-          username (string)
-          dna_sample (string)
-        Response:
-          200 + v2 GalacticBuf { token: string } on success
-          400 on invalid input / invalid DNA format
-          401 if no user / no DNA registered / no sample within threshold
-        """
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        username = (data.get("username") or "").strip()
-        dna_sample_raw = data.get("dna_sample") or ""
-
-        if not username or not dna_sample_raw:
-            self._send_no_content(400)
-            return
-
-        dna = self._normalize_and_validate_dna(dna_sample_raw)
-        if dna is None:
-            self._send_no_content(400)
-            return
-
-        if username not in USERS:
-            self._send_no_content(401)
-            return
-        ref_samples = DNA_SAMPLES.get(username)
-        if not ref_samples:
-            self._send_no_content(401)
-            return
-
-        authenticated = False
-        for ref in ref_samples:
-            codon_count = len(ref) // 3
-            allowed_diff = codon_count // 100000  # floor(Ca / 100000)
-            diff = self._codon_distance(ref, dna, allowed_diff)
-            if diff <= allowed_diff:
-                authenticated = True
-                break
-
-        if not authenticated:
-            self._send_no_content(401)
-            return
-
-        token = uuid.uuid4().hex
-        TOKENS[token] = username
-
-        self._send_gbuf(200, {"token": token})
-
     # ---------- V1 orders & trades ----------
 
     def handle_list_orders(self, parsed):
@@ -507,6 +361,7 @@ class Handler(BaseHTTPRequestHandler):
         coll = COLLATERAL.get(username)
         if coll is None:
             return True  # unlimited
+        # Only check orders that can reduce balance
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
         base = self._compute_potential_balance(username)
@@ -522,6 +377,7 @@ class Handler(BaseHTTPRequestHandler):
         if coll is None:
             return True
 
+        # Recompute potential balance assuming the target order has (new_price, new_quantity)
         base = BALANCES.get(username, 0)
         side_for_target = None
 
@@ -548,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                 base += price * qty
 
         if side_for_target is None:
+            # Order not found as active – let other logic handle 404
             return True
 
         if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
@@ -599,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
+        # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -611,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
+        # Build candidate list on opposite side
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -621,8 +480,9 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
+            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:
+        else:  # sell
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -632,6 +492,7 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
+            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
         # Self-match prevention BEFORE any trades / book changes
@@ -659,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]
+            trade_price = resting["price"]  # maker price
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -754,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
+        # Self-match prevention: compute candidates with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -784,6 +646,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(412)
                 return
 
+        # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -793,6 +656,7 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
+        # Apply modifications
         order["price"] = new_price
         order["quantity"] = new_quantity
 
@@ -803,6 +667,7 @@ class Handler(BaseHTTPRequestHandler):
         remaining = order["quantity"]
         filled_quantity = 0
 
+        # Matching loop using precomputed candidates
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -930,7 +795,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
+        # Bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
+        # Asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -1024,7 +891,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (global feed) ----------
+    # ---------- public trades (unchanged, still global feed) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1144,6 +1011,7 @@ class Handler(BaseHTTPRequestHandler):
         potential = self._compute_potential_balance(username)
         collateral = COLLATERAL.get(username)
         if collateral is None:
+            # unlimited collateral – represent as a very large int
             collateral = 9223372036854775807  # 2^63 - 1
 
         self._send_gbuf(200, {
