@@ -3,6 +3,16 @@ from urllib.parse import urlparse, parse_qs
 from galacticbuffer import encode_message, decode_message
 import uuid
 import time
+import os
+import json
+
+# ---------- persistence config ----------
+
+PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
+STATE_FILE = None
+if PERSISTENT_DIR:
+    os.makedirs(PERSISTENT_DIR, exist_ok=True)
+    STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json")
 
 USERS = {}
 TOKENS = {}
@@ -14,6 +24,54 @@ TRADES = []
 # New: balances + collateral
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
+
+
+def _load_persistent_state():
+    """
+    Load USERS, BALANCES, COLLATERAL, TRADES from STATE_FILE.
+    V2_ORDERS and ORDERS are intentionally NOT loaded -> order book resets.
+    """
+    global USERS, TRADES, BALANCES, COLLATERAL
+
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        # If anything goes wrong, start with empty state
+        return
+
+    USERS = data.get("USERS", {}) or {}
+    BALANCES = data.get("BALANCES", {}) or {}
+    COLLATERAL = data.get("COLLATERAL", {}) or {}
+    TRADES = data.get("TRADES", []) or []
+
+
+def _save_persistent_state():
+    """
+    Save USERS, BALANCES, COLLATERAL, TRADES to STATE_FILE.
+    Does NOT save ORDERS/V2_ORDERS -> they reset on restart.
+    """
+    if not STATE_FILE:
+        return
+
+    data = {
+        "USERS": USERS,
+        "BALANCES": BALANCES,
+        "COLLATERAL": COLLATERAL,
+        "TRADES": TRADES,
+    }
+
+    tmp_path = STATE_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        # Persistence is best-effort; ignore failures here
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,6 +104,9 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         return TOKENS.get(token)
+
+    def _persist(self):
+        _save_persistent_state()
 
     # ----- balances / collateral helpers -----
 
@@ -209,11 +270,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
+        self._persist()
         self._send_no_content(204)
 
     def handle_login(self):
         try:
-            raw = self.__read_body()
+            raw = self._read_body()  # fixed: __read_body -> _read_body
             data = decode_message(raw)
         except Exception:
             self._send_no_content(401)
@@ -269,6 +331,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(500)
             return
 
+        self._persist()
         self._send_no_content(204)
 
     # ---------- V1 orders & trades ----------
@@ -563,6 +626,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status = "FILLED"
 
+        self._persist()
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -722,6 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             order["quantity"] = 0
             order["status"] = "FILLED"
 
+        self._persist()
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -1010,6 +1075,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
+        self._persist()
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1047,6 +1113,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
+        self._persist()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1219,6 +1286,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
         # If we got here, all operations succeeded
+        self._persist()
         self._send_gbuf(200, {"results": results})
 
     # --------- INTERNAL HELPERS FOR BULK OPS ---------
@@ -1499,6 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run():
+    _load_persistent_state()
     server = HTTPServer(("", 8080), Handler)
     print("Server running on port 8080...")
     server.serve_forever()
