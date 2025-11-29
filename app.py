@@ -5,13 +5,15 @@ import uuid
 import time
 import base64
 import hashlib
+import os
+import json
 
 USERS = {}
 TOKENS = {}
 
-ORDERS = []
-V2_ORDERS = []
-TRADES = []
+ORDERS = []       # V1 orders (non-persistent)
+V2_ORDERS = []    # V2 orders (persistent)
+TRADES = []       # Trades (persistent)
 
 # New: balances + collateral
 BALANCES = {}     # username -> int
@@ -23,6 +25,59 @@ DNA_SAMPLES = {}
 
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
+
+# ---------- persistence setup ----------
+
+PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
+STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_DIR else None
+
+
+def load_state():
+    global USERS, V2_ORDERS, TRADES, BALANCES, COLLATERAL, DNA_SAMPLES
+    if not STATE_FILE:
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception:
+        # Corrupted / unreadable file → start fresh in memory
+        return
+
+    USERS = data.get("users", {})
+    V2_ORDERS = data.get("v2_orders", [])
+    TRADES = data.get("trades", [])
+    BALANCES = data.get("balances", {})
+    COLLATERAL = data.get("collateral", {})
+    DNA_SAMPLES = data.get("dna_samples", {})
+
+
+def save_state():
+    if not STATE_FILE:
+        return
+    data = {
+        "users": USERS,
+        "v2_orders": V2_ORDERS,
+        "trades": TRADES,
+        "balances": BALANCES,
+        "collateral": COLLATERAL,
+        "dna_samples": DNA_SAMPLES,
+        # NOTE: TOKENS and V1 ORDERS are intentionally not persisted
+    }
+    tmp = STATE_FILE + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        # If saving fails, ignore; old state (if any) remains
+        pass
+
+
+# Load state on startup
+load_state()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -327,7 +382,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            self.handle_bulk_operations()
+            # Not implemented yet
+            self.send_response(501)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path == "/dna-submit":
             self.handle_dna_submit()
         elif self.path == "/dna-login":
@@ -400,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
+        save_state()
         self._send_no_content(204)
 
     def handle_login(self):
@@ -456,6 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
+            save_state()
         except Exception:
             self._send_no_content(500)
             return
@@ -496,6 +556,7 @@ class Handler(BaseHTTPRequestHandler):
         if dna_sample not in samples:
             samples.append(dna_sample)
 
+        save_state()
         self._send_no_content(204)
 
     def handle_dna_login(self):
@@ -628,6 +689,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         ORDERS.append(order)
 
+        # V1 orders are not persisted
         self._send_gbuf(200, {"order_id": order_id})
 
     # ---------- collateral checks ----------
@@ -687,42 +749,64 @@ class Handler(BaseHTTPRequestHandler):
 
         return base >= -coll
 
-    # ---------- V2 core create/modify/cancel helpers ----------
+    # ---------- V2 submit (matching engine + IOC/FOK) ----------
 
-    def _v2_create_core(self, username: str, side: str, price: int, quantity: int,
-                        delivery_start: int, delivery_end: int, execution_type: str):
+    def handle_submit_order_v2(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        side = (data.get("side") or "").strip()
+        execution_type = (data.get("execution_type") or "GTC").strip() or "GTC"
         if execution_type not in ("GTC", "IOC", "FOK"):
             self._send_no_content(400)
-            return None
+            return
+
+        try:
+            price = int(data.get("price"))
+            quantity = int(data.get("quantity"))
+            delivery_start = int(data.get("delivery_start"))
+            delivery_end = int(data.get("delivery_end"))
+        except Exception:
+            self._send_no_content(400)
+            return
 
         if side not in ("buy", "sell"):
             self._send_no_content(400)
-            return None
+            return
 
         if quantity <= 0:
             self._send_no_content(400)
-            return None
+            return
 
         HOUR_MS = 3600000
         if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
             self._send_no_content(400)
-            return None
+            return
         if delivery_end <= delivery_start:
             self._send_no_content(400)
-            return None
+            return
         if delivery_end - delivery_start != HOUR_MS:
             self._send_no_content(400)
-            return None
+            return
 
         if not self._check_trading_window(delivery_start):
-            return None
+            return
 
         # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
             self.end_headers()
-            return None
+            return
 
         order_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
@@ -760,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
         for resting in candidates:
             if resting.get("owner") == username:
                 self._send_no_content(412)
-                return None
+                return
 
         # FOK: dry-run to see if full quantity can be filled immediately
         if execution_type == "FOK":
@@ -774,11 +858,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if total_possible < quantity:
                 # Cannot fully fill -> cancel, no trades, no book entry
-                return {
+                self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
                     "filled_quantity": 0,
-                }
+                })
+                return
 
         # Matching loop (used by all types once we've passed FOK dry-run)
         for resting in candidates:
@@ -852,16 +937,42 @@ class Handler(BaseHTTPRequestHandler):
             # so remaining should be 0 here.
             status = "FILLED"
 
-        return {
+        save_state()
+        self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
             "filled_quantity": filled_quantity,
-        }
+        })
 
-    def _v2_modify_core(self, username: str, order_id: str, new_price: int, new_quantity: int):
+    # ---------- V2 modify / cancel ----------
+
+    def handle_modify_order(self, order_id: str):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        if "price" not in data or "quantity" not in data:
+            self._send_no_content(400)
+            return
+
+        try:
+            new_price = int(data.get("price"))
+            new_quantity = int(data.get("quantity"))
+        except Exception:
+            self._send_no_content(400)
+            return
+
         if new_quantity <= 0:
             self._send_no_content(400)
-            return None
+            return
 
         order = None
         for o in V2_ORDERS:
@@ -871,11 +982,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
-            return None
+            return
 
         if order.get("owner") != username:
             self._send_no_content(403)
-            return None
+            return
 
         side = order["side"]
         delivery_start = order["delivery_start"]
@@ -910,14 +1021,14 @@ class Handler(BaseHTTPRequestHandler):
         for resting in candidates:
             if resting.get("owner") == username:
                 self._send_no_content(412)
-                return None
+                return
 
         # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
             self.end_headers()
-            return None
+            return
 
         old_price = order["price"]
         old_quantity = order["quantity"]
@@ -987,13 +1098,19 @@ class Handler(BaseHTTPRequestHandler):
             order["quantity"] = 0
             order["status"] = "FILLED"
 
-        return {
+        save_state()
+        self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
             "filled_quantity": filled_quantity,
-        }
+        })
 
-    def _v2_cancel_core(self, username: str, order_id: str):
+    def handle_cancel_order(self, order_id: str):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
         order = None
         for o in V2_ORDERS:
             if o.get("order_id") == order_id:
@@ -1002,99 +1119,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
-            return False
+            return
 
         if order.get("owner") != username:
             self._send_no_content(403)
-            return False
+            return
 
         order["status"] = "CANCELLED"
         order["quantity"] = 0
-        return True
 
-    # ---------- V2 submit (matching engine + IOC/FOK) ----------
-
-    def handle_submit_order_v2(self):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
-
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        side = (data.get("side") or "").strip()
-        execution_type = (data.get("execution_type") or "GTC").strip() or "GTC"
-
-        try:
-            price = int(data.get("price"))
-            quantity = int(data.get("quantity"))
-            delivery_start = int(data.get("delivery_start"))
-            delivery_end = int(data.get("delivery_end"))
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        res = self._v2_create_core(
-            username=username,
-            side=side,
-            price=price,
-            quantity=quantity,
-            delivery_start=delivery_start,
-            delivery_end=delivery_end,
-            execution_type=execution_type,
-        )
-        if res is None:
-            return
-
-        self._send_gbuf(200, res)
-
-    # ---------- V2 modify / cancel ----------
-
-    def handle_modify_order(self, order_id: str):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
-
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        if "price" not in data or "quantity" not in data:
-            self._send_no_content(400)
-            return
-
-        try:
-            new_price = int(data.get("price"))
-            new_quantity = int(data.get("quantity"))
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        res = self._v2_modify_core(username, order_id, new_price, new_quantity)
-        if res is None:
-            return
-
-        self._send_gbuf(200, res)
-
-    def handle_cancel_order(self, order_id: str):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
-
-        ok = self._v2_cancel_core(username, order_id)
-        if not ok:
-            return
-
+        save_state()
         self._send_no_content(204)
 
     # ---------- V2 order book / my-orders / my-trades ----------
@@ -1365,6 +1399,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
+        save_state()
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1402,6 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
+        save_state()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1457,128 +1493,6 @@ class Handler(BaseHTTPRequestHandler):
         TRADE_STREAM_CLIENTS.append(self.request)
         # We don't read frames; stream is server -> client only.
         # When the client disconnects, send will fail and we drop it.
-
-    # ---------- Bulk operations ----------
-
-    def handle_bulk_operations(self):
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        contracts = data.get("contracts")
-        if not isinstance(contracts, list):
-            self._send_no_content(400)
-            return
-
-        results = []
-
-        for contract in contracts:
-            try:
-                delivery_start = int(contract.get("delivery_start"))
-                delivery_end = int(contract.get("delivery_end"))
-            except Exception:
-                self._send_no_content(400)
-                return
-
-            HOUR_MS = 3600000
-            if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
-                self._send_no_content(400)
-                return
-            if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
-                self._send_no_content(400)
-                return
-
-            if not self._check_trading_window(delivery_start):
-                # _check_trading_window already sent 425/451
-                return
-
-            ops = contract.get("operations")
-            if not isinstance(ops, list):
-                self._send_no_content(400)
-                return
-
-            for op in ops:
-                op_type = (op.get("type") or "").strip()
-                participant_token = (op.get("participant_token") or "").strip()
-                if not op_type or not participant_token:
-                    self._send_no_content(400)
-                    return
-
-                username = TOKENS.get(participant_token)
-                if not username:
-                    self._send_no_content(401)
-                    return
-
-                if op_type == "create":
-                    side = (op.get("side") or "").strip()
-                    execution_type = (op.get("execution_type") or "GTC").strip() or "GTC"
-                    try:
-                        price = int(op.get("price"))
-                        quantity = int(op.get("quantity"))
-                    except Exception:
-                        self._send_no_content(400)
-                        return
-
-                    res = self._v2_create_core(
-                        username=username,
-                        side=side,
-                        price=price,
-                        quantity=quantity,
-                        delivery_start=delivery_start,
-                        delivery_end=delivery_end,
-                        execution_type=execution_type,
-                    )
-                    if res is None:
-                        # Error already sent
-                        return
-                    results.append({
-                        "type": "create",
-                        "order_id": res["order_id"],
-                        "status": res["status"],
-                    })
-
-                elif op_type == "modify":
-                    order_id = (op.get("order_id") or "").strip()
-                    if not order_id:
-                        self._send_no_content(400)
-                        return
-                    try:
-                        price = int(op.get("price"))
-                        quantity = int(op.get("quantity"))
-                    except Exception:
-                        self._send_no_content(400)
-                        return
-
-                    res = self._v2_modify_core(username, order_id, price, quantity)
-                    if res is None:
-                        return
-                    results.append({
-                        "type": "modify",
-                        "order_id": res["order_id"],
-                    })
-
-                elif op_type == "cancel":
-                    order_id = (op.get("order_id") or "").strip()
-                    if not order_id:
-                        self._send_no_content(400)
-                        return
-
-                    ok = self._v2_cancel_core(username, order_id)
-                    if not ok:
-                        return
-                    results.append({
-                        "type": "cancel",
-                        "order_id": order_id,
-                    })
-
-                else:
-                    self._send_no_content(400)
-                    return
-
-        self._send_gbuf(200, {"results": results})
 
 
 def run():
