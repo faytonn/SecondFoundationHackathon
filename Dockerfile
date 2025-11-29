@@ -5,6 +5,7 @@ WORKDIR /app
 # Copy server and galactic buffer implementation
 COPY app.py .
 COPY galacticbuffer.py .
+COPY changePassword.py .
 
 EXPOSE 8080
 

@@ -98,6 +98,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+
+    # -- forgot password --
+    def do_PUT(self):
+        if self.path == "/user/password":
+            self.handle_change_password()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
     # ---------- /register ----------
 
     def handle_register(self):
@@ -262,10 +272,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- /trades (POST) ----------
 
+       # ---------- /trades (POST) ----------
     def handle_take_order(self):
         # Requires authentication
         username = self._get_authenticated_user()
         if not username:
+            # 401 Unauthorized – no valid token
             self._send_no_content(401)
             return
 
@@ -273,14 +285,17 @@ class Handler(BaseHTTPRequestHandler):
             raw = self._read_body()
             data = decode_message(raw)
         except Exception:
+            # Bad GalacticBuf → treat as bad request
             self._send_no_content(400)
             return
 
         order_id = (data.get("order_id") or "").strip()
         if not order_id:
+            # 400 Bad Request – order_id missing/empty
             self._send_no_content(400)
             return
 
+        # Find active order by id
         order = None
         for o in ORDERS:
             if o.get("order_id") == order_id and o.get("active", True):
@@ -288,16 +303,15 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
         if not order:
-            # Order doesn't exist or is not active
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            # 404 Not Found – order doesn't exist or not active
+            self._send_no_content(404)
             return
 
-        # Mark order as filled / inactive
+        # Mark order as FILLED / inactive
         order["active"] = False
 
-        # Create trade
+        # Create trade record
+        import time
         trade_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
 
@@ -305,12 +319,13 @@ class Handler(BaseHTTPRequestHandler):
             "trade_id": trade_id,
             "buyer_id": username,
             "seller_id": order["seller_id"],
-            "price": order["price"],
-            "quantity": order["quantity"],
+            "price": int(order["price"]),
+            "quantity": int(order["quantity"]),
             "timestamp": now_ms,
         }
         TRADES.append(trade)
 
+        # 200 OK with GalacticBuf { trade_id }
         self._send_gbuf(200, {"trade_id": trade_id})
 
 
