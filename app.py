@@ -24,94 +24,6 @@ EXECUTION_REPORT_CLIENTS = {}
 
 
 class Handler(BaseHTTPRequestHandler):
-        # WebSocket for order book streaming
-    def handle_order_book_stream(self):
-        if self.command != "GET":
-            self.send_response(405)
-            self.end_headers()
-            return
-
-        key = self.headers.get("Sec-WebSocket-Key")
-        upgrade = (self.headers.get("Upgrade") or "").lower()
-        connection = (self.headers.get("Connection") or "").lower()
-
-        if not key or "websocket" not in upgrade or "upgrade" not in connection:
-            self.send_response(400)
-            self.end_headers()
-            return
-
-        # Generate WebSocket accept response
-        accept_seed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        accept = base64.b64encode(
-            hashlib.sha1(accept_seed.encode("utf-8")).digest()
-        ).decode("utf-8")
-
-        self.send_response(101, "Switching Protocols")
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", accept)
-        self.end_headers()
-
-        self._is_websocket = True
-        sock = self.request
-        ORDER_BOOK_STREAM_CLIENTS.append(sock)
-
-        try:
-            while True:
-                data = sock.recv(1024)
-                if not data:
-                    break
-        except Exception:
-            pass
-        finally:
-            try:
-                ORDER_BOOK_STREAM_CLIENTS.remove(sock)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    # Broadcast order book change (ADD, MODIFY, REMOVE) to WebSocket clients
-    def _broadcast_order_book_change(self, order: dict, change_type: str):
-        if not ORDER_BOOK_STREAM_CLIENTS:
-            return
-
-        payload = encode_message({
-            "order_id": str(order["order_id"]),
-            "side": order["side"],
-            "price": int(order["price"]),
-            "quantity": int(order["quantity"]),
-            "delivery_start": int(order["delivery_start"]),
-            "delivery_end": int(order["delivery_end"]),
-            "change_type": change_type,
-            "timestamp": int(time.time() * 1000),  # Current timestamp
-        })
-        frame = self._ws_build_binary_frame(payload)
-
-        for sock in list(ORDER_BOOK_STREAM_CLIENTS):
-            try:
-                sock.sendall(frame)
-            except Exception:
-                try:
-                    ORDER_BOOK_STREAM_CLIENTS.remove(sock)
-                except ValueError:
-                    pass
-
-    # WebSocket binary frame builder (GalacticBuf encoding)
-    def _ws_build_binary_frame(self, payload: bytes) -> bytes:
-        fin_opcode = 0x82  # Final frame with binary message
-        length = len(payload)
-
-        if length < 126:
-            header = bytes([fin_opcode, length])
-        elif length < (1 << 16):
-            header = bytes([fin_opcode, 126]) + length.to_bytes(2, "big")
-        else:
-            header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
-
-        return header + payload
     def _check_trading_window(self, delivery_start: int):
         now_ms = int(time.time() * 1000)
 
@@ -877,6 +789,147 @@ class Handler(BaseHTTPRequestHandler):
                         balance += p * qty
 
         return balance >= -coll
+    def handle_order_book_stream(self):
+        if self.command != "GET":
+            self.send_response(405)
+            self.end_headers()
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key")
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        connection = (self.headers.get("Connection") or "").lower()
+
+        if not key or "websocket" not in upgrade or "upgrade" not in connection:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        accept_seed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = base64.b64encode(
+            hashlib.sha1(accept_seed.encode("utf-8")).digest()
+        ).decode("utf-8")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        self._is_websocket = True
+
+        sock = self.request
+        ORDER_BOOK_STREAM_CLIENTS.append(sock)
+
+        try:
+            while True:
+                data = sock.recv(1024)
+                if not data:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                ORDER_BOOK_STREAM_CLIENTS.remove(sock)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+    def _broadcast_order_book_change(self, order: dict, change_type: str):
+        if not ORDER_BOOK_STREAM_CLIENTS:
+            return
+
+        payload = encode_message({
+            "order_id": str(order["order_id"]),
+            "side": order["side"],
+            "price": int(order["price"]),
+            "quantity": int(order["quantity"]),
+            "delivery_start": int(order["delivery_start"]),
+            "delivery_end": int(order["delivery_end"]),
+            "change_type": change_type,
+            "timestamp": int(time.time() * 1000),
+        })
+        frame = self._ws_build_binary_frame(payload)
+
+        for sock in list(ORDER_BOOK_STREAM_CLIENTS):
+            try:
+                sock.sendall(frame)
+            except Exception:
+                try:
+                    ORDER_BOOK_STREAM_CLIENTS.remove(sock)
+                except ValueError:
+                    pass
+    def _ws_build_binary_frame(self, payload: bytes) -> bytes:
+        fin_opcode = 0x82
+        length = len(payload)
+        if length < 126:
+            header = bytes([fin_opcode, length])
+        elif length < (1 << 16):
+            header = bytes([fin_opcode, 126]) + length.to_bytes(2, "big")
+        else:
+            header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
+        return header + payload
+    def handle_v2_order_book(self, parsed):
+        qs = parse_qs(parsed.query)
+        if "delivery_start" not in qs or "delivery_end" not in qs:
+            self._send_no_content(400)
+            return
+
+        try:
+            delivery_start = int(qs["delivery_start"][0])
+            delivery_end = int(qs["delivery_end"][0])
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            self._send_no_content(400)
+            return
+        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000
+        CLOSE_MS = 60 * 1000
+        now_ms = int(time.time() * 1000)
+
+        open_time = delivery_start - OPEN_MS
+        close_time = delivery_start - CLOSE_MS
+
+        if not (open_time <= now_ms <= close_time):
+            return self._send_gbuf(200, {"bids": [], "asks": []})
+
+        bids = []
+        asks = []
+
+        for o in V2_ORDERS:
+            if o.get("status") != "ACTIVE":
+                continue
+            if o["quantity"] <= 0:
+                continue
+            if o["delivery_start"] != delivery_start or o["delivery_end"] != delivery_end:
+                continue
+
+            entry = {
+                "order_id": o["order_id"],
+                "price": o["price"],
+                "quantity": o["quantity"],
+            }
+
+            if o["side"] == "buy":
+                bids.append((o, entry))
+            else:
+                asks.append((o, entry))
+
+        bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
+        asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
+
+        bids_payload = [e for _, e in bids]
+        asks_payload = [e for _, e in asks]
+
+        self._send_gbuf(200, {"bids": bids_payload, "asks": asks_payload})
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -888,17 +941,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif parsed.path == "/health":
+                    body = b"OK"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
 
+        elif parsed.path == "/v2/stream/order-book":
+            self.handle_order_book_stream()
+        
+        elif parsed.path == "/v2/order-book":
+            self.handle_v2_order_book(parsed)
         elif parsed.path == "/orders":
             self.handle_list_orders(parsed)
 
         elif parsed.path == "/trades":
             self.handle_list_trades()
-            parsed = urlparse(self.path)
 
-        elif parsed.path == "/v2/stream/order-book":
-            self.handle_order_book_stream()
-        
         elif parsed.path == "/v2/orders":
             self.handle_v2_order_book(parsed)
 
@@ -1709,9 +1770,6 @@ class Handler(BaseHTTPRequestHandler):
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
             self._broadcast_trade(trade)
-            self._broadcast_order_book_change(order, "ADD")   # For new orders
-            self._broadcast_order_book_change(order, "MODIFY")  # For modified orders
-            self._broadcast_order_book_change(order, "REMOVE")  # For canceled or fully filled orders
 
             remaining -= trade_qty
             filled_quantity += trade_qty
