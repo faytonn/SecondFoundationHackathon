@@ -316,46 +316,49 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
+        # Find matching orders
         if side == "buy":
+            # Buy order matches with sell orders at price <= buy price
             candidates = [
                 o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
+                if o.get("status") == "ACTIVE"
                 and o["side"] == "sell"
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
                 and o["quantity"] > 0
-                and o["price"] <= price
+                and o["price"] <= price  # Can match at or below our buy price
             ]
+            # Sort: lowest price first, then oldest (FIFO at same price)
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
+            # Sell order matches with buy orders at price >= sell price
             candidates = [
                 o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
+                if o.get("status") == "ACTIVE"
                 and o["side"] == "buy"
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
                 and o["quantity"] > 0
-                and o["price"] >= price
+                and o["price"] >= price  # Can match at or above our sell price
             ]
+            # Sort: highest price first, then oldest (FIFO at same price)
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
+        # Execute matches
         for resting in candidates:
             if remaining <= 0:
                 break
-            if resting.get("status", "ACTIVE") != "ACTIVE":
-                continue
-            if resting["quantity"] <= 0:
+
+            # Double-check the order is still valid
+            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
                 continue
 
-            if side == "buy" and price < resting["price"]:
-                continue
-            if side == "sell" and price > resting["price"]:
-                continue
-
+            # Calculate trade quantity
             trade_qty = min(remaining, resting["quantity"])
             if trade_qty <= 0:
                 continue
 
+            # Determine buyer and seller
             if side == "buy":
                 buyer_id = username
                 seller_id = resting["owner"]
@@ -363,9 +366,12 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
+            # Trade price is ALWAYS the resting order's price (maker price)
             trade_price = resting["price"]
+
+            # Create trade record
             trade_id = uuid.uuid4().hex
-            ts = int(time.time() * 1000)
+            trade_ts = int(time.time() * 1000)
 
             TRADES.append({
                 "trade_id": trade_id,
@@ -373,9 +379,10 @@ class Handler(BaseHTTPRequestHandler):
                 "seller_id": seller_id,
                 "price": trade_price,
                 "quantity": trade_qty,
-                "timestamp": ts,
+                "timestamp": trade_ts,
             })
 
+            # Update quantities
             remaining -= trade_qty
             filled_quantity += trade_qty
 
@@ -384,6 +391,7 @@ class Handler(BaseHTTPRequestHandler):
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
+        # After matching, if there's remaining quantity, add to order book
         if remaining > 0:
             status = "ACTIVE"
             V2_ORDERS.append({
@@ -398,8 +406,10 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": now_ms,
             })
         else:
+            # Order was completely filled
             status = "FILLED"
 
+        # Return response with status and filled quantity
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -430,20 +440,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
+        # New quantity must be positive
         if new_quantity <= 0:
             self._send_no_content(400)
             return
 
+        # Find order
         order = None
         for o in V2_ORDERS:
             if o.get("order_id") == order_id:
                 order = o
                 break
 
+        # Order must exist and be ACTIVE with remaining quantity
         if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
             return
 
+        # Must be owner
         if order.get("owner") != username:
             self._send_no_content(403)
             return
@@ -451,9 +465,11 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
+        # Apply new price & quantity
         order["price"] = new_price
         order["quantity"] = new_quantity
 
+        # Time priority rules
         now_ms = int(time.time() * 1000)
         if new_price != old_price or new_quantity > old_quantity:
             order["created_at"] = now_ms
@@ -463,7 +479,9 @@ class Handler(BaseHTTPRequestHandler):
         delivery_end = order["delivery_end"]
 
         remaining = order["quantity"]
+        filled_quantity = 0  # <-- track how much is matched in this modify
 
+        # Build matching candidates (opposite side, same contract, price-crossing)
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -475,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                 and o["order_id"] != order_id
                 and o["price"] <= new_price
             ]
+            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
             candidates = [
@@ -487,8 +506,10 @@ class Handler(BaseHTTPRequestHandler):
                 and o["order_id"] != order_id
                 and o["price"] >= new_price
             ]
+            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
+        # Matching loop
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -497,6 +518,7 @@ class Handler(BaseHTTPRequestHandler):
             if resting["quantity"] <= 0:
                 continue
 
+            # extra safety (already filtered by price)
             if side == "buy" and new_price < resting["price"]:
                 continue
             if side == "sell" and new_price > resting["price"]:
@@ -513,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]
+            trade_price = resting["price"]  # maker price
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -527,17 +549,24 @@ class Handler(BaseHTTPRequestHandler):
             })
 
             remaining -= trade_qty
+            filled_quantity += trade_qty       # <-- accumulate
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
+        # Update modified order state
         order["quantity"] = remaining
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
 
-        self._send_no_content(200)
+        # IMPORTANT: Matching Engine spec style response
+        self._send_gbuf(200, {
+            "order_id": order["order_id"],
+            "status": order["status"],
+            "filled_quantity": filled_quantity,
+        })
 
     def handle_cancel_order(self, order_id: str):
         username = self._get_authenticated_user()
@@ -551,7 +580,7 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
+        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
             return
 
@@ -589,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
         asks = []
 
         for o in V2_ORDERS:
-            if o.get("status", "ACTIVE") != "ACTIVE":
+            if o.get("status") != "ACTIVE":
                 continue
             if o["quantity"] <= 0:
                 continue
@@ -607,7 +636,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
+        # Sort bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
+        # Sort asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -624,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
         my_active = [
             o for o in V2_ORDERS
             if o.get("owner") == username
-            and o.get("status", "ACTIVE") == "ACTIVE"
+            and o.get("status") == "ACTIVE"
             and o["quantity"] > 0
         ]
 
@@ -688,8 +719,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(404)
             return
 
+        # Mark as inactive (don't remove from list)
         order["active"] = False
-        ORDERS.remove(order)
 
         trade_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
