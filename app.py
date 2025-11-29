@@ -13,14 +13,13 @@ ORDERS = []
 V2_ORDERS = []
 TRADES = []
 
-BALANCES = {}
-COLLATERAL = {}
+BALANCES = {}     # username -> int
+COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
 DNA_SAMPLES = {}
 
 TRADE_STREAM_CLIENTS = []
 ORDER_BOOK_STREAM_CLIENTS = []
-EXECUTION_REPORT_CLIENTS = {}  # username -> list of sockets
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -248,40 +247,6 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     ORDER_BOOK_STREAM_CLIENTS.remove(sock)
                 except ValueError:
-                    pass
-
-    def _broadcast_execution_report(self, order: dict):
-        owner = order.get("owner")
-        if not owner:
-            return
-        clients = EXECUTION_REPORT_CLIENTS.get(owner)
-        if not clients:
-            return
-
-        filled = int(order.get("filled_quantity", 0))
-        remaining = int(order.get("quantity", 0))
-        original = filled + remaining
-
-        payload = encode_message({
-            "order_id": str(order["order_id"]),
-            "status": str(order.get("status", "ACTIVE")),
-            "side": str(order["side"]),
-            "price": int(order["price"]),
-            "filled_quantity": filled,
-            "remaining_quantity": remaining,
-            "delivery_start": int(order["delivery_start"]),
-            "delivery_end": int(order["delivery_end"]),
-            "timestamp": int(time.time() * 1000),
-        })
-        frame = self._ws_build_binary_frame(payload)
-
-        for sock in list(clients):
-            try:
-                sock.sendall(frame)
-            except Exception:
-                try:
-                    clients.remove(sock)
-                except Exception:
                     pass
 
     def _bulk_sim_create(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
@@ -811,9 +776,6 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/v2/stream/order-book":
             self.handle_order_book_stream()
 
-        elif parsed.path == "/v2/stream/execution-reports":
-            self.handle_execution_reports_stream(parsed)
-
         else:
             self.send_response(404)
             self.end_headers()
@@ -1057,73 +1019,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def handle_execution_reports_stream(self, parsed):
-        if self.command != "GET":
-            self.send_response(405)
-            self.end_headers()
-            return
-
-        qs = parse_qs(parsed.query)
-        token = (qs.get("token", [None])[0] or "").strip()
-
-        key = self.headers.get("Sec-WebSocket-Key")
-        upgrade = (self.headers.get("Upgrade") or "").lower()
-        connection = (self.headers.get("Connection") or "").lower()
-
-        if not key or "websocket" not in upgrade or "upgrade" not in connection:
-            self.send_response(400)
-            self.end_headers()
-            return
-
-        accept_seed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        accept = base64.b64encode(
-            hashlib.sha1(accept_seed.encode("utf-8")).digest()
-        ).decode("utf-8")
-
-        self.send_response(101, "Switching Protocols")
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
-        self.send_header("Sec-WebSocket-Accept", accept)
-        self.end_headers()
-
-        self._is_websocket = True
-        sock = self.request
-
-        username = TOKENS.get(token)
-        if not token or not username:
-            try:
-                code = 1008
-                payload = code.to_bytes(2, "big")
-                frame = bytes([0x88, len(payload)]) + payload
-                sock.sendall(frame)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
-            return
-
-        user_list = EXECUTION_REPORT_CLIENTS.setdefault(username, [])
-        user_list.append(sock)
-
-        try:
-            while True:
-                data = sock.recv(1024)
-                if not data:
-                    break
-        except Exception:
-            pass
-        finally:
-            try:
-                user_list.remove(sock)
-            except Exception:
-                pass
-            try:
-                sock.close()
-            except Exception:
-                pass
-
     def handle_bulk_operations(self):
         try:
             body = self._read_body()
@@ -1159,7 +1054,9 @@ class Handler(BaseHTTPRequestHandler):
 
             for op in ops:
                 optype = op.get("type")
-                token = op.get("participant_token", "")
+                token = op.get("participant_token")
+                if token is None:
+                    return self._send_no_content(400)
                 username = TOKENS.get(token)
                 if not username:
                     return self._send_no_content(401)
@@ -1182,10 +1079,8 @@ class Handler(BaseHTTPRequestHandler):
             if result["action"] == "create":
                 order_data = result["order"]
                 if order_data is not None and result.get("status") == "ACTIVE":
-                    order_data["filled_quantity"] = 0
                     V2_ORDERS.append(order_data)
                     self._broadcast_order_book_change(order_data, "ADD")
-                    self._broadcast_execution_report(order_data)
 
                 for trade in result.get("trades", []):
                     TRADES.append(trade)
@@ -1205,14 +1100,11 @@ class Handler(BaseHTTPRequestHandler):
                 target["status"] = result["status"]
                 if "created_at" in result:
                     target["created_at"] = result["created_at"]
-                target.setdefault("filled_quantity", 0)
 
                 if target["status"] == "ACTIVE":
                     self._broadcast_order_book_change(target, "MODIFY")
                 else:
                     self._broadcast_order_book_change(target, "REMOVE")
-
-                self._broadcast_execution_report(target)
 
                 for trade in result.get("trades", []):
                     TRADES.append(trade)
@@ -1228,11 +1120,8 @@ class Handler(BaseHTTPRequestHandler):
                 order_id = result["order_id"]
                 target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
                 target["status"] = "CANCELLED"
-                target.setdefault("filled_quantity", 0)
-                remaining_before = target["quantity"]
                 target["quantity"] = 0
                 self._broadcast_order_book_change(target, "REMOVE")
-                self._broadcast_execution_report(target)
 
         results = []
         for result in staged_operations:
@@ -1240,7 +1129,7 @@ class Handler(BaseHTTPRequestHandler):
                 "type": result["action"],
                 "order_id": result["order_id"],
             }
-            if "status" in result:
+            if result["action"] == "create":
                 entry["status"] = result["status"]
             results.append(entry)
 
@@ -1515,19 +1404,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
-        taker_state = {
-            "order_id": order_id,
-            "side": side,
-            "owner": username,
-            "price": price,
-            "quantity": remaining,
-            "delivery_start": delivery_start,
-            "delivery_end": delivery_end,
-            "status": "ACTIVE",
-            "filled_quantity": filled_quantity,
-        }
-        self._broadcast_execution_report(taker_state)
-
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -1566,11 +1442,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
             if total_possible < quantity:
-                taker_state["status"] = "CANCELLED"
-                taker_state["quantity"] = quantity
-                taker_state["filled_quantity"] = 0
-                self._broadcast_execution_report(taker_state)
-
                 self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
@@ -1618,8 +1489,6 @@ class Handler(BaseHTTPRequestHandler):
             remaining -= trade_qty
             filled_quantity += trade_qty
 
-            resting.setdefault("filled_quantity", 0)
-            resting["filled_quantity"] += trade_qty
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
@@ -1627,13 +1496,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._broadcast_order_book_change(resting, "REMOVE")
             else:
                 self._broadcast_order_book_change(resting, "MODIFY")
-
-            self._broadcast_execution_report(resting)
-
-            taker_state["quantity"] = remaining
-            taker_state["filled_quantity"] = filled_quantity
-            taker_state["status"] = "FILLED" if remaining <= 0 else "ACTIVE"
-            self._broadcast_execution_report(taker_state)
 
         if execution_type == "GTC":
             if remaining > 0:
@@ -1648,22 +1510,15 @@ class Handler(BaseHTTPRequestHandler):
                     "delivery_end": delivery_end,
                     "status": "ACTIVE",
                     "created_at": now_ms,
-                    "filled_quantity": filled_quantity,
                 }
                 V2_ORDERS.append(new_order)
                 self._broadcast_order_book_change(new_order, "ADD")
-                self._broadcast_execution_report(new_order)
             else:
                 status = "FILLED"
         elif execution_type == "IOC":
             status = "FILLED" if remaining <= 0 else "CANCELLED"
         else:
             status = "FILLED"
-
-        taker_state["quantity"] = remaining
-        taker_state["filled_quantity"] = filled_quantity
-        taker_state["status"] = status
-        self._broadcast_execution_report(taker_state)
 
         self._send_gbuf(200, {
             "order_id": order_id,
@@ -1758,14 +1613,13 @@ class Handler(BaseHTTPRequestHandler):
 
         order["price"] = new_price
         order["quantity"] = new_quantity
-        order.setdefault("filled_quantity", 0)
 
         now_ms = int(time.time() * 1000)
         if new_price != old_price or new_quantity > old_quantity:
             order["created_at"] = now_ms
 
         remaining = order["quantity"]
-        filled_quantity_delta = 0
+        filled_quantity = 0
 
         for resting in candidates:
             if remaining <= 0:
@@ -1809,10 +1663,7 @@ class Handler(BaseHTTPRequestHandler):
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
-            filled_quantity_delta += trade_qty
-
-            resting.setdefault("filled_quantity", 0)
-            resting["filled_quantity"] += trade_qty
+            filled_quantity += trade_qty
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
@@ -1821,10 +1672,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._broadcast_order_book_change(resting, "MODIFY")
 
-            self._broadcast_execution_report(resting)
-
         order["quantity"] = remaining
-        order["filled_quantity"] = order.get("filled_quantity", 0) + filled_quantity_delta
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
@@ -1834,12 +1682,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._broadcast_order_book_change(order, "REMOVE")
 
-        self._broadcast_execution_report(order)
-
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
-            "filled_quantity": filled_quantity_delta,
+            "filled_quantity": filled_quantity,
         })
 
     def handle_cancel_order(self, order_id: str):
@@ -1862,12 +1708,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(403)
             return
 
-        order.setdefault("filled_quantity", 0)
         order["status"] = "CANCELLED"
         order["quantity"] = 0
 
         self._broadcast_order_book_change(order, "REMOVE")
-        self._broadcast_execution_report(order)
 
         self._send_no_content(204)
 
