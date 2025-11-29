@@ -60,24 +60,52 @@ class Handler(BaseHTTPRequestHandler):
 
     def _compute_potential_balance(self, username: str) -> int:
         """
-        Potential balance = current balance + effect if all ACTIVE V2 orders fill.
-        Buy -> pays price * qty (subtract)
-        Sell -> receives price * qty (add)
+        Potential balance = current balance + effect if all ACTIVE orders fill.
+
+        Includes:
+          - V1 ORDERS (always sells at positive price)
+          - V2_ORDERS (buys/sells with side)
         """
         balance = BALANCES.get(username, 0)
+
+        # --- V1 orders: always sells made by seller_id ---
+        for o in ORDERS:
+            if not o.get("active", True):
+                continue
+            if o.get("seller_id") != username:
+                continue
+            try:
+                qty = int(o.get("quantity", 0))
+                price = int(o.get("price", 0))
+            except Exception:
+                continue
+            if qty <= 0:
+                continue
+            # V1 is always sell at positive price -> user receives price * qty
+            balance += price * qty
+
+        # --- V2 orders: buys and sells ---
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
             if o.get("status") != "ACTIVE":
                 continue
-            qty = int(o.get("quantity", 0))
+            try:
+                qty = int(o.get("quantity", 0))
+                price = int(o.get("price", 0))
+            except Exception:
+                continue
             if qty <= 0:
                 continue
-            price = int(o["price"])
-            if o["side"] == "buy":
+
+            side = o.get("side")
+            if side == "buy":
+                # Buy: user pays price * qty
                 balance -= price * qty
-            else:
+            elif side == "sell":
+                # Sell: user receives price * qty
                 balance += price * qty
+
         return balance
 
     # ---------- HTTP methods ----------

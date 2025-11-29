@@ -7,7 +7,7 @@ TYPE_OBJECT = 0x04
 TYPE_BYTES = 0x05  # new in v2
 
 
-# ---------- ENCODING (v1) ----------
+# ---------- ENCODING (v1 helpers – kept for completeness) ----------
 
 def _encode_int(value: int) -> bytes:
     # 64-bit signed, big-endian
@@ -85,17 +85,96 @@ def _encode_list_v1(values, elem_type: int) -> bytes:
     return bytes(out)
 
 
+# ---------- ENCODING (v2 helpers) ----------
+
+def _encode_string_v2(value: str) -> bytes:
+    data = value.encode("utf-8")
+    # 4-byte length, up to 4GB
+    return struct.pack(">I", len(data)) + data
+
+
+def _encode_bytes_v2(value: bytes) -> bytes:
+    # 4-byte length + raw bytes
+    return struct.pack(">I", len(value)) + value
+
+
+def _encode_object_v2(obj: dict) -> bytes:
+    """
+    Encodes an object (type 0x04 value) in v2:
+    [field_count][field1][field2]...[fieldN]
+    Each field: [name_len][name][type][value] with v2 sizes (4-byte string/bytes length, 4-byte list count).
+    We support ints, strings, bytes inside objects (same as v2 decoder).
+    """
+    field_bytes = bytearray()
+    field_count = 0
+
+    for name, value in obj.items():
+        name_bytes = name.encode("utf-8")
+        if not (1 <= len(name_bytes) <= 255):
+            raise ValueError("invalid field name length in object")
+
+        field_bytes.append(len(name_bytes))
+        field_bytes += name_bytes
+
+        if isinstance(value, int):
+            field_bytes.append(TYPE_INT)
+            field_bytes += struct.pack(">q", int(value))
+
+        elif isinstance(value, str):
+            field_bytes.append(TYPE_STRING)
+            field_bytes += _encode_string_v2(value)
+
+        elif isinstance(value, (bytes, bytearray)):
+            field_bytes.append(TYPE_BYTES)
+            field_bytes += _encode_bytes_v2(bytes(value))
+
+        else:
+            raise NotImplementedError(f"unsupported object field type for {name!r}: {type(value)}")
+
+        field_count += 1
+
+    if field_count > 255:
+        raise ValueError("too many fields in object")
+
+    return bytes([field_count]) + field_bytes
+
+
+def _encode_list_v2(values, elem_type: int) -> bytes:
+    """
+    v2 list encoding:
+    [elem_type][4-byte count][encoded elements...]
+    """
+    out = bytearray()
+    out.append(elem_type)
+    out += struct.pack(">I", len(values))
+
+    if elem_type == TYPE_INT:
+        for v in values:
+            out += struct.pack(">q", int(v))
+    elif elem_type == TYPE_STRING:
+        for v in values:
+            out += _encode_string_v2(v)
+    elif elem_type == TYPE_OBJECT:
+        for v in values:
+            if not isinstance(v, dict):
+                raise ValueError("list with object type but non-dict value")
+            out += _encode_object_v2(v)
+    elif elem_type == TYPE_BYTES:
+        for v in values:
+            out += _encode_bytes_v2(bytes(v))
+    else:
+        raise NotImplementedError("unsupported list element type for v2")
+
+    return bytes(out)
+
+
 def encode_message(fields: dict) -> bytes:
     """
-    Encode as GalacticBuf v1 (version 0x01).
-
-    fields: dict like:
-      {
-        "user_id": 1001,
-        "name": "Alice",
-        "scores": [100, 200, 300],
-        "orders": [ { ... }, { ... } ]
-      }
+    Encode as GalacticBuf v2 (version 0x02).
+    - 6-byte header: [version=0x02][field_count][total_length(4 bytes)]
+    - 4-byte string lengths
+    - 4-byte list element counts
+    - bytes supported (TYPE_BYTES)
     """
     field_bytes = bytearray()
 
@@ -111,45 +190,47 @@ def encode_message(fields: dict) -> bytes:
         # type + value
         if isinstance(value, int):
             field_bytes.append(TYPE_INT)
-            field_bytes += _encode_int(value)
+            field_bytes += struct.pack(">q", int(value))
 
         elif isinstance(value, str):
             field_bytes.append(TYPE_STRING)
-            field_bytes += _encode_string_v1(value)
-
-        elif isinstance(value, list):
-            if all(isinstance(v, int) for v in value):
-                field_bytes.append(TYPE_LIST)
-                field_bytes += _encode_list_v1(value, TYPE_INT)
-            elif all(isinstance(v, str) for v in value):
-                field_bytes.append(TYPE_LIST)
-                field_bytes += _encode_list_v1(value, TYPE_STRING)
-            elif all(isinstance(v, dict) for v in value):
-                field_bytes.append(TYPE_LIST)
-                field_bytes += _encode_list_v1(value, TYPE_OBJECT)
-            else:
-                raise NotImplementedError("mixed-type lists not supported")
-
-        elif isinstance(value, dict):
-            # single nested object
-            field_bytes.append(TYPE_OBJECT)
-            field_bytes += _encode_object_v1(value)
+            field_bytes += _encode_string_v2(value)
 
         elif isinstance(value, (bytes, bytearray)):
-            # we *could* support bytes encoding as v2-only, but our app never sends bytes
-            # so for now we avoid emitting TYPE_BYTES to keep v1 simple
-            raise NotImplementedError("bytes encoding not used in responses")
+            field_bytes.append(TYPE_BYTES)
+            field_bytes += _encode_bytes_v2(bytes(value))
+
+        elif isinstance(value, list):
+            # choose element type
+            if not value:
+                # empty list – encode as empty list of strings by convention
+                elem_type = TYPE_STRING
+            elif all(isinstance(v, int) for v in value):
+                elem_type = TYPE_INT
+            elif all(isinstance(v, str) for v in value):
+                elem_type = TYPE_STRING
+            elif all(isinstance(v, dict) for v in value):
+                elem_type = TYPE_OBJECT
+            elif all(isinstance(v, (bytes, bytearray)) for v in value):
+                elem_type = TYPE_BYTES
+            else:
+                raise NotImplementedError("mixed-type lists not supported in v2 encoder")
+
+            field_bytes.append(TYPE_LIST)
+            field_bytes += _encode_list_v2(value, elem_type)
+
+        elif isinstance(value, dict):
+            field_bytes.append(TYPE_OBJECT)
+            field_bytes += _encode_object_v2(value)
 
         else:
             raise NotImplementedError(f"unsupported type for field {name!r}: {type(value)}")
 
-    version = 0x01
+    version = 0x02
     field_count = len(fields)
-    total_length = 4 + len(field_bytes)  # header (4) + payload
-    if total_length > 0xFFFF:
-        raise ValueError("message too big for v1")
+    total_length = 6 + len(field_bytes)  # header (6) + payload
 
-    header = struct.pack(">BBH", version, field_count, total_length)
+    header = struct.pack(">BBI", version, field_count, total_length)
     return header + field_bytes
 
 
@@ -497,7 +578,7 @@ def decode_message(data: bytes) -> dict:
 
 
 if __name__ == "__main__":
-    # Simple self-test for v1
+    # Simple self-test
     msg = encode_message({
         "user_id": 1001,
         "name": "Alice",
