@@ -11,15 +11,17 @@ import json
 USERS = {}
 TOKENS = {}
 
-ORDERS = []
-V2_ORDERS = []
-TRADES = []
+ORDERS = []       # V1 orders (in-memory only, not persisted)
+V2_ORDERS = []    # V2 orders (persisted)
+TRADES = []       # All trades; V2 trades must persist, V1 can but don't have to
 
-# New: balances + collateral
+# balances are derived from V2 trades (recomputed on startup from persisted trades)
 BALANCES = {}     # username -> int
+
+# collateral limits (persisted)
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
-# New: DNA samples
+# DNA samples (persisted)
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
 
@@ -33,6 +35,10 @@ STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_D
 
 
 def _rebuild_balances_from_trades():
+    """
+    Rebuild BALANCES from persisted trades.
+    We consider all trades (v1 + v2); v2 are required, v1 is fine to include.
+    """
     global BALANCES
     BALANCES = {}
     for t in TRADES:
@@ -51,6 +57,10 @@ def _rebuild_balances_from_trades():
 
 
 def _load_state():
+    """
+    Load persisted exchange state (users, v2 orders, trades, collateral, dna).
+    V1 orders are intentionally not persisted.
+    """
     global USERS, V2_ORDERS, TRADES, COLLATERAL, DNA_SAMPLES
     if not STATE_FILE:
         return
@@ -74,9 +84,11 @@ def _load_state():
 
 
 def _save_state():
-    if not STATE_FILE:
-        return
-    if not PERSISTENT_DIR:
+    """
+    Persist users, v2 orders, trades, collateral, dna samples.
+    Best-effort: failures are ignored.
+    """
+    if not STATE_FILE or not PERSISTENT_DIR:
         return
     data = {
         "users": USERS,
@@ -92,7 +104,7 @@ def _save_state():
             json.dump(data, f)
         os.replace(tmp_path, STATE_FILE)
     except Exception:
-        # Best-effort persistence; ignore failures
+        # Best-effort persistence
         pass
 
 
@@ -298,9 +310,7 @@ class Handler(BaseHTTPRequestHandler):
         ref_count = len(ref_codons)
         allowed_diff = ref_count // 100000  # floor(Ca/100000)
 
-        # If ref is very short, allowed_diff might be 0 -> exact or within 0 edits
         max_diff = allowed_diff
-
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
         return dist <= allowed_diff
 
@@ -319,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         return header + payload
 
     def _broadcast_trade(self, trade: dict):
-        # Only V2 trades should be broadcast; caller ensures this
+        # Only V2 trades should be broadcast; caller ensures this via "source": "v2".
         if not TRADE_STREAM_CLIENTS:
             return
         payload = encode_message({
@@ -376,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # NEW: public V2 trades endpoint
+            # public V2 trades endpoint
             self.handle_v2_trades(parsed)
 
         elif parsed.path == "/v2/stream/trades":
@@ -949,7 +959,6 @@ class Handler(BaseHTTPRequestHandler):
             status = "FILLED" if remaining <= 0 else "CANCELLED"
         else:  # FOK
             # We already ensured via dry-run that we can fully fill
-            # so remaining should be 0 here.
             status = "FILLED"
 
         _save_state()
@@ -1298,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades (global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1316,7 +1325,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- NEW: public V2-only trades for a contract ----------
+    # ---------- public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
