@@ -11,6 +11,51 @@ ORDERS = []
 V2_ORDERS = []
 TRADES = []
 
+# username -> list of DNA samples (strings)
+DNA_DB = {}
+
+
+# ---------- DNA HELPERS (shared) ----------
+
+def is_valid_dna(seq: str) -> bool:
+    if not seq:
+        return False
+    if len(seq) % 3 != 0:
+        return False
+    allowed_chars = {"C", "G", "A", "T"}
+    return all(c in allowed_chars for c in seq)
+
+
+def codon_edit_distance(a: str, b: str) -> int:
+    """
+    Compute Levenshtein distance between two DNA sequences
+    at the codon level (3-character groups).
+    Operations: insertion, deletion, substitution (cost=1).
+    """
+    codons_a = [a[i:i+3] for i in range(0, len(a), 3)]
+    codons_b = [b[i:i+3] for i in range(0, len(b), 3)]
+
+    n = len(codons_a)
+    m = len(codons_b)
+
+    prev = list(range(m + 1))
+    curr = [0] * (m + 1)
+
+    for i in range(1, n + 1):
+        curr[0] = i
+        ca = codons_a[i - 1]
+        for j in range(1, m + 1):
+            cb = codons_b[j - 1]
+            cost = 0 if ca == cb else 1
+            curr[j] = min(
+                prev[j] + 1,       # deletion
+                curr[j - 1] + 1,   # insertion
+                prev[j - 1] + cost # substitution
+            )
+        prev, curr = curr, prev
+
+    return prev[m]
+
 
 class Handler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes:
@@ -40,6 +85,8 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         return TOKENS.get(token)
+
+    # ---------- HTTP METHODS ----------
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -79,6 +126,10 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_submit_order_v2()
         elif self.path == "/trades":
             self.handle_take_order()
+        elif self.path == "/dna-submit":
+            self.handle_dna_submit()
+        elif self.path == "/dna-login":
+            self.handle_dna_login()
         else:
             self.send_response(404)
             self.end_headers()
@@ -102,6 +153,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    # ---------- AUTH & USERS ----------
 
     def handle_register(self):
         try:
@@ -176,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             USERS[username] = new_password
-            tokens_to_delete = [t for t, u in TOKENS.items() if u == username]
+            tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
         except Exception:
@@ -184,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._send_no_content(204)
+
+    # ---------- V1 ORDERS ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -268,6 +323,8 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"order_id": order_id})
 
+    # ---------- V2: SUBMIT + MATCHING ----------
+
     def handle_submit_order_v2(self):
         username = self._get_authenticated_user()
         if not username:
@@ -303,10 +360,7 @@ class Handler(BaseHTTPRequestHandler):
         if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
             self._send_no_content(400)
             return
-        if delivery_end <= delivery_start:
-            self._send_no_content(400)
-            return
-        if delivery_end - delivery_start != HOUR_MS:
+        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
             self._send_no_content(400)
             return
 
@@ -316,9 +370,7 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
-        # Find matching orders
         if side == "buy":
-            # Buy order matches with sell orders at price <= buy price
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -326,12 +378,10 @@ class Handler(BaseHTTPRequestHandler):
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
                 and o["quantity"] > 0
-                and o["price"] <= price  # Can match at or below our buy price
+                and o["price"] <= price
             ]
-            # Sort: lowest price first, then oldest (FIFO at same price)
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
-            # Sell order matches with buy orders at price >= sell price
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -339,26 +389,20 @@ class Handler(BaseHTTPRequestHandler):
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
                 and o["quantity"] > 0
-                and o["price"] >= price  # Can match at or above our sell price
+                and o["price"] >= price
             ]
-            # Sort: highest price first, then oldest (FIFO at same price)
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Execute matches
         for resting in candidates:
             if remaining <= 0:
                 break
-
-            # Double-check the order is still valid
             if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
                 continue
 
-            # Calculate trade quantity
             trade_qty = min(remaining, resting["quantity"])
             if trade_qty <= 0:
                 continue
 
-            # Determine buyer and seller
             if side == "buy":
                 buyer_id = username
                 seller_id = resting["owner"]
@@ -366,10 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            # Trade price is ALWAYS the resting order's price (maker price)
             trade_price = resting["price"]
-
-            # Create trade record
             trade_id = uuid.uuid4().hex
             trade_ts = int(time.time() * 1000)
 
@@ -382,7 +423,6 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": trade_ts,
             })
 
-            # Update quantities
             remaining -= trade_qty
             filled_quantity += trade_qty
 
@@ -391,7 +431,6 @@ class Handler(BaseHTTPRequestHandler):
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
-        # After matching, if there's remaining quantity, add to order book
         if remaining > 0:
             status = "ACTIVE"
             V2_ORDERS.append({
@@ -406,10 +445,8 @@ class Handler(BaseHTTPRequestHandler):
                 "created_at": now_ms,
             })
         else:
-            # Order was completely filled
             status = "FILLED"
 
-        # Return response with status and filled quantity
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -440,24 +477,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # New quantity must be positive
         if new_quantity <= 0:
             self._send_no_content(400)
             return
 
-        # Find order
         order = None
         for o in V2_ORDERS:
             if o.get("order_id") == order_id:
                 order = o
                 break
 
-        # Order must exist and be ACTIVE with remaining quantity
         if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
             return
 
-        # Must be owner
         if order.get("owner") != username:
             self._send_no_content(403)
             return
@@ -465,11 +498,9 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
-        # Apply new price & quantity
         order["price"] = new_price
         order["quantity"] = new_quantity
 
-        # Time priority rules
         now_ms = int(time.time() * 1000)
         if new_price != old_price or new_quantity > old_quantity:
             order["created_at"] = now_ms
@@ -479,9 +510,8 @@ class Handler(BaseHTTPRequestHandler):
         delivery_end = order["delivery_end"]
 
         remaining = order["quantity"]
-        filled_quantity = 0  # <-- track how much is matched in this modify
+        filled_quantity = 0
 
-        # Build matching candidates (opposite side, same contract, price-crossing)
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -493,7 +523,6 @@ class Handler(BaseHTTPRequestHandler):
                 and o["order_id"] != order_id
                 and o["price"] <= new_price
             ]
-            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
             candidates = [
@@ -506,10 +535,8 @@ class Handler(BaseHTTPRequestHandler):
                 and o["order_id"] != order_id
                 and o["price"] >= new_price
             ]
-            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Matching loop
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -518,7 +545,6 @@ class Handler(BaseHTTPRequestHandler):
             if resting["quantity"] <= 0:
                 continue
 
-            # extra safety (already filtered by price)
             if side == "buy" and new_price < resting["price"]:
                 continue
             if side == "sell" and new_price > resting["price"]:
@@ -535,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]  # maker price
+            trade_price = resting["price"]
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -549,19 +575,17 @@ class Handler(BaseHTTPRequestHandler):
             })
 
             remaining -= trade_qty
-            filled_quantity += trade_qty       # <-- accumulate
+            filled_quantity += trade_qty
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
-        # Update modified order state
         order["quantity"] = remaining
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
 
-        # IMPORTANT: Matching Engine spec style response
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -592,6 +616,8 @@ class Handler(BaseHTTPRequestHandler):
         order["quantity"] = 0
 
         self._send_no_content(204)
+
+    # ---------- V2 ORDER BOOK & MY ORDERS ----------
 
     def handle_v2_order_book(self, parsed):
         qs = parse_qs(parsed.query)
@@ -636,9 +662,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
-        # Sort bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
-        # Sort asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -674,6 +698,8 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"orders": orders_payload})
+
+    # ---------- TRADES (V1) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -719,7 +745,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(404)
             return
 
-        # Mark as inactive (don't remove from list)
         order["active"] = False
 
         trade_id = uuid.uuid4().hex
@@ -736,6 +761,116 @@ class Handler(BaseHTTPRequestHandler):
         TRADES.append(trade)
 
         self._send_gbuf(200, {"trade_id": trade_id})
+
+    # ---------- DNA ENDPOINTS ----------
+
+    def handle_dna_submit(self):
+        """
+        POST /dna-submit
+        GalacticBuf body:
+          username (string)
+          password (string)
+          dna_sample (string)
+
+        - 400: invalid input or invalid DNA
+        - 401: wrong username/password
+        - 204: success
+        """
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        username = (data.get("username") or "").strip()
+        password = (data.get("password") or "")
+        dna_sample = (data.get("dna_sample") or "").strip()
+
+        if not username or not password or not dna_sample:
+            self._send_no_content(400)
+            return
+
+        if not is_valid_dna(dna_sample):
+            self._send_no_content(400)
+            return
+
+        user_password = USERS.get(username)
+        if user_password is None:
+            self._send_no_content(401)
+            return
+
+        if user_password != password:
+            self._send_no_content(401)
+            return
+
+        if username not in DNA_DB:
+            DNA_DB[username] = []
+        if dna_sample not in DNA_DB[username]:
+            DNA_DB[username].append(dna_sample)
+
+        self._send_no_content(204)
+
+    def handle_dna_login(self):
+        """
+        POST /dna-login
+        GalacticBuf body:
+          username (string)
+          dna_sample (string)
+
+        - 400: invalid input or invalid DNA
+        - 401: user missing / no DNA / no match
+        - 200: { token: string }
+        """
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        username = (data.get("username") or "").strip()
+        dna_sample = (data.get("dna_sample") or "").strip()
+
+        if not username or not dna_sample:
+            self._send_no_content(400)
+            return
+
+        if not is_valid_dna(dna_sample):
+            self._send_no_content(400)
+            return
+
+        if username not in USERS:
+            self._send_no_content(401)
+            return
+
+        registered_samples = DNA_DB.get(username)
+        if not registered_samples:
+            self._send_no_content(401)
+            return
+
+        matched = False
+
+        for ref in registered_samples:
+            ref_codons = len(ref) // 3
+            allowed_diff = ref_codons // 100000
+
+            # If diff==0 and lengths differ, impossible to match
+            if allowed_diff == 0 and len(ref) != len(dna_sample):
+                continue
+
+            dist = codon_edit_distance(ref, dna_sample)
+            if dist <= allowed_diff:
+                matched = True
+                break
+
+        if not matched:
+            self._send_no_content(401)
+            return
+
+        token = uuid.uuid4().hex
+        TOKENS[token] = username
+        self._send_gbuf(200, {"token": token})
 
 
 def run():

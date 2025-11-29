@@ -6,6 +6,7 @@ WORKDIR /app
 COPY app.py .
 COPY galacticbuffer.py .
 COPY changePassword.py .
+COPY dna.py .
 
 EXPOSE 8080
 
