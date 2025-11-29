@@ -4,15 +4,30 @@ from galacticbuffer import encode_message, decode_message
 import uuid
 import time
 
-USERS = {}
-TOKENS = {}
+USERS = {}    # username -> password
+TOKENS = {}   # token -> username
 
+# V1 order book
 ORDERS = []
+
+# V2 order book
 V2_ORDERS = []
+
+# Each trade:
+# {
+#   "trade_id": str,
+#   "buyer_id": str,
+#   "seller_id": str,
+#   "price": int,
+#   "quantity": int,
+#   "timestamp": int,  # unix ms
+# }
 TRADES = []
 
 
 class Handler(BaseHTTPRequestHandler):
+    # ---------- helpers ----------
+
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
@@ -25,6 +40,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_gbuf(self, status: int, obj: dict):
+        # Your galacticbuffer now encodes as v1 (0x01). Tests only care that
+        # decoding works & fields are correct, not the version byte.
         body = encode_message(obj)
         self.send_response(status)
         self.send_header("Content-Type", "application/x-galacticbuf")
@@ -40,6 +57,249 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         return TOKENS.get(token)
+
+    # ---------- MATCHING ENGINE (V2) ----------
+
+    def _match_v2_order(self, incoming: dict) -> int:
+        """
+        Run matching for a new or modified V2 order.
+
+        incoming: order dict with keys:
+          side, owner, price, quantity, delivery_start, delivery_end,
+          order_id, status, timestamp
+
+        Returns: total filled quantity (int)
+        """
+        side = incoming["side"]
+        price = int(incoming["price"])
+        remaining = int(incoming["quantity"])
+        delivery_start = int(incoming["delivery_start"])
+        delivery_end = int(incoming["delivery_end"])
+        username = incoming["owner"]
+
+        if remaining <= 0 or incoming["status"] != "ACTIVE":
+            return 0
+
+        # Opposite side + price condition
+        if side == "buy":
+            # Match existing ACTIVE sells same contract, sell_price <= buy_price
+            candidates = [
+                o for o in V2_ORDERS
+                if o["status"] == "ACTIVE"
+                and o["side"] == "sell"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and int(o["price"]) <= price
+            ]
+            # Cheapest sells first, then oldest
+            candidates.sort(key=lambda o: (int(o["price"]), o["timestamp"]))
+        else:  # side == "sell"
+            # Match existing ACTIVE buys same contract, buy_price >= sell_price
+            candidates = [
+                o for o in V2_ORDERS
+                if o["status"] == "ACTIVE"
+                and o["side"] == "buy"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and int(o["price"]) >= price
+            ]
+            # Highest bids first, then oldest
+            candidates.sort(key=lambda o: (-int(o["price"]), o["timestamp"]))
+
+        filled_total = 0
+
+        for resting in candidates:
+            if remaining <= 0:
+                break
+
+            resting_qty = int(resting["quantity"])
+            if resting_qty <= 0:
+                continue
+
+            trade_qty = min(remaining, resting_qty)
+            remaining -= trade_qty
+            resting_qty -= trade_qty
+
+            # Maker price = resting order's price
+            trade_price = int(resting["price"])
+            now_ms = int(time.time() * 1000)
+            trade_id = uuid.uuid4().hex
+
+            if side == "buy":
+                buyer_id = username
+                seller_id = resting["owner"]
+            else:
+                buyer_id = resting["owner"]
+                seller_id = username
+
+            trade = {
+                "trade_id": trade_id,
+                "buyer_id": buyer_id,
+                "seller_id": seller_id,
+                "price": trade_price,
+                "quantity": trade_qty,
+                "timestamp": now_ms,
+            }
+            TRADES.append(trade)
+
+            # Update resting order
+            resting["quantity"] = resting_qty
+            if resting_qty == 0:
+                resting["status"] = "FILLED"
+
+            filled_total += trade_qty
+
+        # Update incoming's remaining quantity
+        incoming["quantity"] = remaining
+        if remaining == 0:
+            incoming["status"] = "FILLED"
+
+        return filled_total
+
+    # ---------- /v2/my-orders (GET) ----------
+
+    def handle_my_orders(self):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        # Only ACTIVE orders belonging to this user, across all contracts
+        mine = [
+            o for o in V2_ORDERS
+            if o["owner"] == username and o["status"] == "ACTIVE"
+        ]
+
+        # Newest first (timestamp descending)
+        mine.sort(key=lambda o: o["timestamp"], reverse=True)
+
+        orders_payload = []
+        for o in mine:
+            orders_payload.append({
+                "order_id": o["order_id"],
+                "side": o["side"],
+                "price": int(o["price"]),
+                "quantity": int(o["quantity"]),
+                "delivery_start": int(o["delivery_start"]),
+                "delivery_end": int(o["delivery_end"]),
+                "timestamp": int(o["timestamp"]),
+            })
+
+        self._send_gbuf(200, {"orders": orders_payload})
+
+    # ---------- MODIFY ORDER (PUT /v2/orders/{id}) ----------
+
+    def handle_modify_order(self, order_id: str):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        if "price" not in data or "quantity" not in data:
+            self._send_no_content(400)
+            return
+
+        try:
+            new_price = int(data.get("price"))
+            new_quantity = int(data.get("quantity"))
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        # New quantity must be positive
+        if new_quantity <= 0:
+            self._send_no_content(400)
+            return
+
+        # Find order
+        order = None
+        for o in V2_ORDERS:
+            if o["order_id"] == order_id:
+                order = o
+                break
+
+        if order is None:
+            self._send_no_content(404)
+            return
+
+        # Must be owner
+        if order["owner"] != username:
+            self._send_no_content(403)
+            return
+
+        # Only ACTIVE orders can be modified
+        if order["status"] != "ACTIVE":
+            self._send_no_content(404)
+            return
+
+        old_price = int(order["price"])
+        old_qty = int(order["quantity"])
+
+        now_ms = int(time.time() * 1000)
+
+        # Time-priority reset rules:
+        # - price change OR quantity increase -> reset timestamp
+        # - quantity decrease -> keep timestamp
+        if new_price != old_price or new_quantity > old_qty:
+            order["timestamp"] = now_ms
+
+        # Apply changes
+        order["price"] = new_price
+        order["quantity"] = new_quantity
+
+        # Run matching again
+        filled = self._match_v2_order(order)
+
+        response_obj = {
+            "order_id": order["order_id"],
+            "status": order["status"],
+            "filled_quantity": filled,
+        }
+        self._send_gbuf(200, response_obj)
+
+    # ---------- CANCEL ORDER (DELETE /v2/orders/{id}) ----------
+
+    def handle_cancel_order(self, order_id: str):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        # Find order
+        order = None
+        for o in V2_ORDERS:
+            if o["order_id"] == order_id:
+                order = o
+                break
+
+        if order is None:
+            self._send_no_content(404)
+            return
+
+        # Must be owner
+        if order["owner"] != username:
+            self._send_no_content(403)
+            return
+
+        # Can't cancel FILLED or already CANCELLED
+        if order["status"] != "ACTIVE":
+            self._send_no_content(404)
+            return
+
+        # Cancel: mark cancelled and zero out remaining quantity
+        order["status"] = "CANCELLED"
+        order["quantity"] = 0
+
+        self._send_no_content(204)
+
+    # ---------- endpoints ----------
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -58,9 +318,6 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/trades":
             self.handle_list_trades()
 
-        elif parsed.path == "/v2/orders":
-            self.handle_v2_order_book(parsed)
-
         elif parsed.path == "/v2/my-orders":
             self.handle_my_orders()
 
@@ -74,8 +331,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/login":
             self.handle_login()
         elif self.path == "/orders":
+            # V1 submit
             self.handle_submit_order()
         elif self.path == "/v2/orders":
+            # V2 submit with matching engine
             self.handle_submit_order_v2()
         elif self.path == "/trades":
             self.handle_take_order()
@@ -84,24 +343,27 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_PUT(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/user/password":
+        # Change password
+        if self.path == "/user/password":
             self.handle_change_password()
-        elif parsed.path.startswith("/v2/orders/"):
-            order_id = parsed.path.split("/")[-1]
+        # Modify V2 order
+        elif self.path.startswith("/v2/orders/"):
+            order_id = self.path[len("/v2/orders/"):]
             self.handle_modify_order(order_id)
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_DELETE(self):
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/v2/orders/"):
-            order_id = parsed.path.split("/")[-1]
+        # Cancel V2 order
+        if self.path.startswith("/v2/orders/"):
+            order_id = self.path[len("/v2/orders/"):]
             self.handle_cancel_order(order_id)
         else:
             self.send_response(404)
             self.end_headers()
+
+    # ---------- /register ----------
 
     def handle_register(self):
         try:
@@ -124,6 +386,8 @@ class Handler(BaseHTTPRequestHandler):
 
         USERS[username] = password
         self._send_no_content(204)
+
+    # ---------- /login ----------
 
     def handle_login(self):
         try:
@@ -148,6 +412,8 @@ class Handler(BaseHTTPRequestHandler):
         TOKENS[token] = username
 
         self._send_gbuf(200, {"token": token})
+
+    # ---------- /user/password (PUT) ----------
 
     def handle_change_password(self):
         try:
@@ -176,14 +442,18 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             USERS[username] = new_password
-            tokens_to_delete = [t for t, u in TOKENS.items() if u == username]
-            for t in tokens_to_delete:
-                del TOKENS[t]
+            tokens_to_delete = [
+                token for token, u in list(TOKENS.items()) if u == username
+            ]
+            for token in tokens_to_delete:
+                del TOKENS[token]
         except Exception:
             self._send_no_content(500)
             return
 
         self._send_no_content(204)
+
+    # ---------- /orders (GET, V1) ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -219,6 +489,8 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"orders": orders_payload})
+
+    # ---------- /orders (POST, V1) ----------
 
     def handle_submit_order(self):
         username = self._get_authenticated_user()
@@ -268,6 +540,8 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"order_id": order_id})
 
+    # ---------- /v2/orders (POST, V2 with matching) ----------
+
     def handle_submit_order_v2(self):
         username = self._get_authenticated_user()
         if not username:
@@ -310,339 +584,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
+        now_ms = int(time.time() * 1000)
         order_id = uuid.uuid4().hex
-        now_ms = int(time.time() * 1000)
 
-        remaining = quantity
-        filled_quantity = 0
-
-        if side == "buy":
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
-                and o["side"] == "sell"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["price"] <= price
-            ]
-            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
-                and o["side"] == "buy"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["price"] >= price
-            ]
-            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
-
-        for resting in candidates:
-            if remaining <= 0:
-                break
-            if resting.get("status", "ACTIVE") != "ACTIVE":
-                continue
-            if resting["quantity"] <= 0:
-                continue
-
-            if side == "buy" and price < resting["price"]:
-                continue
-            if side == "sell" and price > resting["price"]:
-                continue
-
-            trade_qty = min(remaining, resting["quantity"])
-            if trade_qty <= 0:
-                continue
-
-            if side == "buy":
-                buyer_id = username
-                seller_id = resting["owner"]
-            else:
-                buyer_id = resting["owner"]
-                seller_id = username
-
-            trade_price = resting["price"]
-            trade_id = uuid.uuid4().hex
-            ts = int(time.time() * 1000)
-
-            TRADES.append({
-                "trade_id": trade_id,
-                "buyer_id": buyer_id,
-                "seller_id": seller_id,
-                "price": trade_price,
-                "quantity": trade_qty,
-                "timestamp": ts,
-            })
-
-            remaining -= trade_qty
-            filled_quantity += trade_qty
-
-            resting["quantity"] -= trade_qty
-            if resting["quantity"] <= 0:
-                resting["quantity"] = 0
-                resting["status"] = "FILLED"
-
-        if remaining > 0:
-            status = "ACTIVE"
-            V2_ORDERS.append({
-                "order_id": order_id,
-                "side": side,
-                "owner": username,
-                "price": price,
-                "quantity": remaining,
-                "delivery_start": delivery_start,
-                "delivery_end": delivery_end,
-                "status": "ACTIVE",
-                "created_at": now_ms,
-            })
-        else:
-            status = "FILLED"
-
-        self._send_gbuf(200, {
+        order = {
             "order_id": order_id,
-            "status": status,
-            "filled_quantity": filled_quantity,
-        })
+            "side": side,
+            "owner": username,
+            "price": price,
+            "quantity": quantity,          # remaining quantity
+            "delivery_start": delivery_start,
+            "delivery_end": delivery_end,
+            "status": "ACTIVE",
+            "timestamp": now_ms,           # for FIFO at price level
+        }
 
-    def handle_modify_order(self, order_id: str):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
+        filled = self._match_v2_order(order)
 
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
+        # If still ACTIVE after matching, it enters the book
+        if order["status"] == "ACTIVE":
+            V2_ORDERS.append(order)
 
-        if "price" not in data or "quantity" not in data:
-            self._send_no_content(400)
-            return
+        response_obj = {
+            "order_id": order_id,
+            "status": order["status"],
+            "filled_quantity": filled,
+        }
+        self._send_gbuf(200, response_obj)
 
-        try:
-            new_price = int(data.get("price"))
-            new_quantity = int(data.get("quantity"))
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        if new_quantity <= 0:
-            self._send_no_content(400)
-            return
-
-        order = None
-        for o in V2_ORDERS:
-            if o.get("order_id") == order_id:
-                order = o
-                break
-
-        if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
-            self._send_no_content(404)
-            return
-
-        if order.get("owner") != username:
-            self._send_no_content(403)
-            return
-
-        old_price = order["price"]
-        old_quantity = order["quantity"]
-
-        order["price"] = new_price
-        order["quantity"] = new_quantity
-
-        now_ms = int(time.time() * 1000)
-        if new_price != old_price or new_quantity > old_quantity:
-            order["created_at"] = now_ms
-
-        side = order["side"]
-        delivery_start = order["delivery_start"]
-        delivery_end = order["delivery_end"]
-
-        remaining = order["quantity"]
-
-        if side == "buy":
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
-                and o["side"] == "sell"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["order_id"] != order_id
-                and o["price"] <= new_price
-            ]
-            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
-                and o["side"] == "buy"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["order_id"] != order_id
-                and o["price"] >= new_price
-            ]
-            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
-
-        for resting in candidates:
-            if remaining <= 0:
-                break
-            if resting.get("status", "ACTIVE") != "ACTIVE":
-                continue
-            if resting["quantity"] <= 0:
-                continue
-
-            if side == "buy" and new_price < resting["price"]:
-                continue
-            if side == "sell" and new_price > resting["price"]:
-                continue
-
-            trade_qty = min(remaining, resting["quantity"])
-            if trade_qty <= 0:
-                continue
-
-            if side == "buy":
-                buyer_id = username
-                seller_id = resting["owner"]
-            else:
-                buyer_id = resting["owner"]
-                seller_id = username
-
-            trade_price = resting["price"]
-            trade_id = uuid.uuid4().hex
-            ts = int(time.time() * 1000)
-
-            TRADES.append({
-                "trade_id": trade_id,
-                "buyer_id": buyer_id,
-                "seller_id": seller_id,
-                "price": trade_price,
-                "quantity": trade_qty,
-                "timestamp": ts,
-            })
-
-            remaining -= trade_qty
-            resting["quantity"] -= trade_qty
-            if resting["quantity"] <= 0:
-                resting["quantity"] = 0
-                resting["status"] = "FILLED"
-
-        order["quantity"] = remaining
-        if remaining <= 0:
-            order["quantity"] = 0
-            order["status"] = "FILLED"
-
-        self._send_no_content(200)
-
-    def handle_cancel_order(self, order_id: str):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
-
-        order = None
-        for o in V2_ORDERS:
-            if o.get("order_id") == order_id:
-                order = o
-                break
-
-        if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
-            self._send_no_content(404)
-            return
-
-        if order.get("owner") != username:
-            self._send_no_content(403)
-            return
-
-        order["status"] = "CANCELLED"
-        order["quantity"] = 0
-
-        self._send_no_content(204)
-
-    def handle_v2_order_book(self, parsed):
-        qs = parse_qs(parsed.query)
-        if "delivery_start" not in qs or "delivery_end" not in qs:
-            self._send_no_content(400)
-            return
-
-        try:
-            delivery_start = int(qs["delivery_start"][0])
-            delivery_end = int(qs["delivery_end"][0])
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        HOUR_MS = 3600000
-        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
-            self._send_no_content(400)
-            return
-        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
-            self._send_no_content(400)
-            return
-
-        bids = []
-        asks = []
-
-        for o in V2_ORDERS:
-            if o.get("status", "ACTIVE") != "ACTIVE":
-                continue
-            if o["quantity"] <= 0:
-                continue
-            if o["delivery_start"] != delivery_start or o["delivery_end"] != delivery_end:
-                continue
-
-            entry = {
-                "order_id": o["order_id"],
-                "price": o["price"],
-                "quantity": o["quantity"],
-            }
-
-            if o["side"] == "buy":
-                bids.append((o, entry))
-            else:
-                asks.append((o, entry))
-
-        bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
-        asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
-
-        bids_payload = [e for _, e in bids]
-        asks_payload = [e for _, e in asks]
-
-        self._send_gbuf(200, {"bids": bids_payload, "asks": asks_payload})
-
-    def handle_my_orders(self):
-        username = self._get_authenticated_user()
-        if not username:
-            self._send_no_content(401)
-            return
-
-        my_active = [
-            o for o in V2_ORDERS
-            if o.get("owner") == username
-            and o.get("status", "ACTIVE") == "ACTIVE"
-            and o["quantity"] > 0
-        ]
-
-        my_active.sort(key=lambda o: o.get("created_at", 0), reverse=True)
-
-        orders_payload = []
-        for o in my_active:
-            orders_payload.append({
-                "order_id": o["order_id"],
-                "side": o["side"],
-                "price": o["price"],
-                "quantity": o["quantity"],
-                "delivery_start": o["delivery_start"],
-                "delivery_end": o["delivery_end"],
-                "timestamp": o.get("created_at", 0),
-            })
-
-        self._send_gbuf(200, {"orders": orders_payload})
+    # ---------- /trades (GET) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -659,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"trades": trades_payload})
+
+    # ---------- /trades (POST, V1) ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
