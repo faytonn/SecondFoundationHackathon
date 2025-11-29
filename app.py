@@ -5,6 +5,8 @@ import uuid
 import time
 import base64
 import hashlib
+import os
+import json
 
 USERS = {}
 TOKENS = {}
@@ -23,6 +25,86 @@ DNA_SAMPLES = {}
 
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
+
+# ---------- persistence ----------
+
+PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
+STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_DIR else None
+
+
+def _rebuild_balances_from_trades():
+    """
+    Recompute BALANCES only from V2 trades.
+    V1 state does not persist across restarts.
+    """
+    global BALANCES
+    BALANCES = {}
+    for t in TRADES:
+        if t.get("source") != "v2":
+            continue
+        try:
+            price = int(t["price"])
+            qty = int(t["quantity"])
+        except Exception:
+            continue
+        amount = price * qty
+        buyer = t["buyer_id"]
+        seller = t["seller_id"]
+        BALANCES[buyer] = BALANCES.get(buyer, 0) - amount
+        BALANCES[seller] = BALANCES.get(seller, 0) + amount
+
+
+def load_state():
+    global USERS, V2_ORDERS, TRADES, DNA_SAMPLES, COLLATERAL
+
+    if not STATE_FILE:
+        return
+
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        # Any failure → start with empty state
+        return
+
+    USERS = data.get("users", {}) or {}
+    DNA_SAMPLES = data.get("dna_samples", {}) or {}
+    COLLATERAL = data.get("collateral", {}) or {}
+
+    V2_ORDERS[:] = data.get("v2_orders", []) or []
+    TRADES[:] = data.get("trades", []) or []
+
+    _rebuild_balances_from_trades()
+
+
+def save_state():
+    if not STATE_FILE:
+        return
+
+    state = {
+        "users": USERS,
+        "dna_samples": DNA_SAMPLES,
+        "collateral": COLLATERAL,
+        "v2_orders": V2_ORDERS,
+        # Persist only V2 trades; V1 state can reset
+        "trades": [t for t in TRADES if t.get("source") == "v2"],
+    }
+
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        # Ignore persistence errors – service must still run
+        pass
+
+
+# Load persisted state on startup
+load_state()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -327,10 +409,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            # Not implemented yet
-            self.send_response(501)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self.handle_bulk_operations()
         elif self.path == "/dna-submit":
             self.handle_dna_submit()
         elif self.path == "/dna-login":
@@ -403,6 +482,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
+        save_state()
         self._send_no_content(204)
 
     def handle_login(self):
@@ -459,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
+            save_state()
         except Exception:
             self._send_no_content(500)
             return
@@ -498,6 +579,7 @@ class Handler(BaseHTTPRequestHandler):
         samples = DNA_SAMPLES.setdefault(username, [])
         if dna_sample not in samples:
             samples.append(dna_sample)
+            save_state()
 
         self._send_no_content(204)
 
@@ -548,7 +630,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"token": token})
 
-    # ---------- V1 orders & trades ----------
+    # ---------- V1 orders & trades (non-persistent) ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -878,6 +960,8 @@ class Handler(BaseHTTPRequestHandler):
             # so remaining should be 0 here.
             status = "FILLED"
 
+        save_state()
+
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -1038,6 +1122,8 @@ class Handler(BaseHTTPRequestHandler):
             order["quantity"] = 0
             order["status"] = "FILLED"
 
+        save_state()
+
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -1067,6 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
         order["status"] = "CANCELLED"
         order["quantity"] = 0
 
+        save_state()
         self._send_no_content(204)
 
     # ---------- V2 order book / my-orders / my-trades ----------
@@ -1221,7 +1308,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades (global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1337,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
+        # V1 trades are not persisted across restarts
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1374,6 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
+        save_state()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1398,6 +1487,454 @@ class Handler(BaseHTTPRequestHandler):
             "potential_balance": int(potential),
             "collateral": int(collateral),
         })
+
+    # ---------- Bulk Operations ----------
+
+    def _get_user_from_token(self, token: str):
+        """Get username from participant token. Returns None if invalid."""
+        if not token:
+            return None
+        return TOKENS.get(token)
+
+    def _execute_create_operation(self, username: str, side: str, price: int, quantity: int,
+                                   delivery_start: int, delivery_end: int, execution_type: str = "GTC"):
+        """Execute a create operation. Returns (success, result_dict, error_code)."""
+        if side not in ("buy", "sell"):
+            return (False, None, 400)
+        if quantity <= 0:
+            return (False, None, 400)
+
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            return (False, None, 400)
+        if delivery_end <= delivery_start:
+            return (False, None, 400)
+        if delivery_end - delivery_start != HOUR_MS:
+            return (False, None, 400)
+
+        now_ms = int(time.time() * 1000)
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000
+        CLOSE_MS = 60 * 1000
+        open_time = delivery_start - OPEN_MS
+        close_time = delivery_start - CLOSE_MS
+        if now_ms < open_time:
+            return (False, None, 425)
+        if now_ms > close_time:
+            return (False, None, 451)
+
+        # Collateral check
+        if not self._check_collateral_create(username, side, price, quantity):
+            return (False, None, 402)
+
+        order_id = uuid.uuid4().hex
+        remaining = quantity
+        filled_quantity = 0
+
+        # Build candidate list on opposite side
+        if side == "buy":
+            candidates = [
+                o for o in V2_ORDERS
+                if o.get("status") == "ACTIVE"
+                and o["side"] == "sell"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and o["quantity"] > 0
+                and o["price"] <= price
+            ]
+            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
+        else:  # sell
+            candidates = [
+                o for o in V2_ORDERS
+                if o.get("status") == "ACTIVE"
+                and o["side"] == "buy"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and o["quantity"] > 0
+                and o["price"] >= price
+            ]
+            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
+
+        # Self-match prevention
+        for resting in candidates:
+            if resting.get("owner") == username:
+                return (False, None, 412)
+
+        # FOK: dry-run
+        if execution_type == "FOK":
+            total_possible = 0
+            for resting in candidates:
+                if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
+                    continue
+                total_possible += resting["quantity"]
+                if total_possible >= quantity:
+                    break
+            if total_possible < quantity:
+                return (True, {
+                    "type": "create",
+                    "order_id": order_id,
+                    "status": "CANCELLED",
+                }, None)
+
+        # Matching loop
+        for resting in candidates:
+            if remaining <= 0:
+                break
+            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
+                continue
+
+            trade_qty = min(remaining, resting["quantity"])
+            if trade_qty <= 0:
+                continue
+
+            if side == "buy":
+                buyer_id = username
+                seller_id = resting["owner"]
+            else:
+                buyer_id = resting["owner"]
+                seller_id = username
+
+            trade_price = resting["price"]
+            trade_id = uuid.uuid4().hex
+            ts = int(time.time() * 1000)
+
+            trade = {
+                "trade_id": trade_id,
+                "buyer_id": buyer_id,
+                "seller_id": seller_id,
+                "price": trade_price,
+                "quantity": trade_qty,
+                "timestamp": ts,
+                "delivery_start": delivery_start,
+                "delivery_end": delivery_end,
+                "source": "v2",
+            }
+            TRADES.append(trade)
+            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
+            self._broadcast_trade(trade)
+
+            remaining -= trade_qty
+            filled_quantity += trade_qty
+
+            resting["quantity"] -= trade_qty
+            if resting["quantity"] <= 0:
+                resting["quantity"] = 0
+                resting["status"] = "FILLED"
+
+        # Decide final status
+        if execution_type == "GTC":
+            if remaining > 0:
+                status = "ACTIVE"
+                V2_ORDERS.append({
+                    "order_id": order_id,
+                    "side": side,
+                    "owner": username,
+                    "price": price,
+                    "quantity": remaining,
+                    "delivery_start": delivery_start,
+                    "delivery_end": delivery_end,
+                    "status": "ACTIVE",
+                    "created_at": now_ms,
+                })
+            else:
+                status = "FILLED"
+        elif execution_type == "IOC":
+            status = "FILLED" if remaining <= 0 else "CANCELLED"
+        else:  # FOK
+            status = "FILLED"
+
+        return (True, {
+            "type": "create",
+            "order_id": order_id,
+            "status": status,
+        }, None)
+
+    def _execute_modify_operation(self, username: str, order_id: str, new_price: int, new_quantity: int):
+        """Execute a modify operation. Returns (success, result_dict, error_code)."""
+        if new_quantity <= 0:
+            return (False, None, 400)
+
+        order = None
+        for o in V2_ORDERS:
+            if o.get("order_id") == order_id:
+                order = o
+                break
+
+        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
+            return (False, None, 404)
+
+        if order.get("owner") != username:
+            return (False, None, 403)
+
+        side = order["side"]
+        delivery_start = order["delivery_start"]
+        delivery_end = order["delivery_end"]
+
+        # Self-match prevention
+        if side == "buy":
+            candidates = [
+                o for o in V2_ORDERS
+                if o.get("status") == "ACTIVE"
+                and o["side"] == "sell"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and o["quantity"] > 0
+                and o["order_id"] != order_id
+                and o["price"] <= new_price
+            ]
+            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
+        else:
+            candidates = [
+                o for o in V2_ORDERS
+                if o.get("status") == "ACTIVE"
+                and o["side"] == "buy"
+                and o["delivery_start"] == delivery_start
+                and o["delivery_end"] == delivery_end
+                and o["quantity"] > 0
+                and o["order_id"] != order_id
+                and o["price"] >= new_price
+            ]
+            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
+
+        for resting in candidates:
+            if resting.get("owner") == username:
+                return (False, None, 412)
+
+        # Collateral check
+        if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
+            return (False, None, 402)
+
+        old_price = order["price"]
+        old_quantity = order["quantity"]
+
+        # Apply modifications
+        order["price"] = new_price
+        order["quantity"] = new_quantity
+
+        now_ms = int(time.time() * 1000)
+        if new_price != old_price or new_quantity > old_quantity:
+            order["created_at"] = now_ms
+
+        remaining = order["quantity"]
+        filled_quantity = 0
+
+        # Matching loop
+        for resting in candidates:
+            if remaining <= 0:
+                break
+            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
+                continue
+
+            if side == "buy" and new_price < resting["price"]:
+                continue
+            if side == "sell" and new_price > resting["price"]:
+                continue
+
+            trade_qty = min(remaining, resting["quantity"])
+            if trade_qty <= 0:
+                continue
+
+            if side == "buy":
+                buyer_id = username
+                seller_id = resting["owner"]
+            else:
+                buyer_id = resting["owner"]
+                seller_id = username
+
+            trade_price = resting["price"]
+            trade_id = uuid.uuid4().hex
+            ts = int(time.time() * 1000)
+
+            trade = {
+                "trade_id": trade_id,
+                "buyer_id": buyer_id,
+                "seller_id": seller_id,
+                "price": trade_price,
+                "quantity": trade_qty,
+                "timestamp": ts,
+                "delivery_start": delivery_start,
+                "delivery_end": delivery_end,
+                "source": "v2",
+            }
+            TRADES.append(trade)
+            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
+            self._broadcast_trade(trade)
+
+            remaining -= trade_qty
+            filled_quantity += trade_qty
+            resting["quantity"] -= trade_qty
+            if resting["quantity"] <= 0:
+                resting["quantity"] = 0
+                resting["status"] = "FILLED"
+
+        order["quantity"] = remaining
+        if remaining <= 0:
+            order["quantity"] = 0
+            order["status"] = "FILLED"
+
+        return (True, {
+            "type": "modify",
+            "order_id": order_id,
+        }, None)
+
+    def _execute_cancel_operation(self, username: str, order_id: str):
+        """Execute a cancel operation. Returns (success, result_dict, error_code)."""
+        order = None
+        for o in V2_ORDERS:
+            if o.get("order_id") == order_id:
+                order = o
+                break
+
+        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
+            return (False, None, 404)
+
+        if order.get("owner") != username:
+            return (False, None, 403)
+
+        order["status"] = "CANCELLED"
+        order["quantity"] = 0
+
+        return (True, {
+            "type": "cancel",
+            "order_id": order_id,
+        }, None)
+
+    def handle_bulk_operations(self):
+        """Handle POST /v2/bulk-operations"""
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        if "contracts" not in data or not isinstance(data["contracts"], list):
+            self._send_no_content(400)
+            return
+
+        results = []
+        all_operations = []
+
+        # First pass: validate structure and collect all operations
+        for contract in data["contracts"]:
+            if not isinstance(contract, dict):
+                self._send_no_content(400)
+                return
+
+            if "delivery_start" not in contract or "delivery_end" not in contract:
+                self._send_no_content(400)
+                return
+
+            try:
+                delivery_start = int(contract["delivery_start"])
+                delivery_end = int(contract["delivery_end"])
+            except Exception:
+                self._send_no_content(400)
+                return
+
+            HOUR_MS = 3600000
+            if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+                self._send_no_content(400)
+                return
+            if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+                self._send_no_content(400)
+                return
+
+            if "operations" not in contract or not isinstance(contract["operations"], list):
+                self._send_no_content(400)
+                return
+
+            for op in contract["operations"]:
+                if not isinstance(op, dict):
+                    self._send_no_content(400)
+                    return
+
+                op_type = op.get("type")
+                if op_type not in ("create", "modify", "cancel"):
+                    self._send_no_content(400)
+                    return
+
+                if "participant_token" not in op:
+                    self._send_no_content(400)
+                    return
+
+                # Validate operation-specific fields
+                if op_type == "create":
+                    if "side" not in op or "price" not in op or "quantity" not in op:
+                        self._send_no_content(400)
+                        return
+                elif op_type == "modify":
+                    if "order_id" not in op or "price" not in op or "quantity" not in op:
+                        self._send_no_content(400)
+                        return
+                elif op_type == "cancel":
+                    if "order_id" not in op:
+                        self._send_no_content(400)
+                        return
+
+                all_operations.append((op, delivery_start, delivery_end))
+
+        # Second pass: execute all operations in order
+        for op, delivery_start, delivery_end in all_operations:
+            op_type = op.get("type")
+            participant_token = op.get("participant_token")
+
+            # Get username from token
+            username = self._get_user_from_token(participant_token)
+            if not username:
+                self._send_no_content(401)
+                return
+
+            success = False
+            result = None
+            error_code = None
+
+            if op_type == "create":
+                try:
+                    side = (op.get("side") or "").strip()
+                    price = int(op.get("price"))
+                    quantity = int(op.get("quantity"))
+                    execution_type = (op.get("execution_type") or "GTC").strip() or "GTC"
+                    if execution_type not in ("GTC", "IOC", "FOK"):
+                        self._send_no_content(400)
+                        return
+                except Exception:
+                    self._send_no_content(400)
+                    return
+
+                success, result, error_code = self._execute_create_operation(
+                    username, side, price, quantity, delivery_start, delivery_end, execution_type
+                )
+
+            elif op_type == "modify":
+                try:
+                    order_id = op.get("order_id")
+                    new_price = int(op.get("price"))
+                    new_quantity = int(op.get("quantity"))
+                except Exception:
+                    self._send_no_content(400)
+                    return
+
+                success, result, error_code = self._execute_modify_operation(
+                    username, order_id, new_price, new_quantity
+                )
+
+            elif op_type == "cancel":
+                order_id = op.get("order_id")
+                success, result, error_code = self._execute_cancel_operation(username, order_id)
+
+            if not success:
+                # Operation failed - return appropriate error
+                self.send_response(error_code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            results.append(result)
+
+        # All operations succeeded - save state and return results
+        save_state()
+
+        self._send_gbuf(200, {"results": results})
 
     # ---------- WebSocket trade stream endpoint ----------
 
@@ -1432,8 +1969,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run():
-    server = HTTPServer(("", 8080), Handler)
-    print("Server running on port 8080...")
+    port = int(os.environ.get("PORT", "8080"))
+    server = HTTPServer(("", port), Handler)
+    print(f"Server running on port {port}...")
     server.serve_forever()
 
 
