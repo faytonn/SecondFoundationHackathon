@@ -1,4 +1,4 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from galacticbuffer import encode_message, decode_message
 import uuid
@@ -13,28 +13,22 @@ ORDERS = []
 V2_ORDERS = []
 TRADES = []
 
-# New: balances + collateral
+# balances + collateral
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
-# New: DNA samples
-# username -> list of registered DNA strings
+# DNA samples: username -> list of DNA strings
 DNA_SAMPLES = {}
 
-# WebSocket trade stream clients (raw sockets)
+# WebSocket clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
+ORDER_BOOK_STREAM_CLIENTS = []
 
 
 class Handler(BaseHTTPRequestHandler):
     # ---------- helpers ----------
 
     def _check_trading_window(self, delivery_start: int):
-        """
-        Returns:
-            True  - inside trading window
-            False - already responded with 425/451
-        """
-
         now_ms = int(time.time() * 1000)
 
         OPEN_MS = 15 * 24 * 60 * 60 * 1000     # 15 days
@@ -88,25 +82,14 @@ class Handler(BaseHTTPRequestHandler):
     # ----- balances / collateral helpers -----
 
     def _apply_trade_balances(self, buyer_id: str, seller_id: str, price: int, quantity: int):
-        """
-        Buyer pays price * quantity, seller receives price * quantity.
-        Negative prices will naturally invert the effect.
-        """
         amount = int(price) * int(quantity)
         BALANCES[buyer_id] = BALANCES.get(buyer_id, 0) - amount
         BALANCES[seller_id] = BALANCES.get(seller_id, 0) + amount
 
     def _compute_potential_balance(self, username: str) -> int:
-        """
-        Potential balance = current balance + effect if all ACTIVE orders fill.
-
-        Includes:
-          - V1 ORDERS (always sells at positive price)
-          - V2_ORDERS (buys/sells with side)
-        """
         balance = BALANCES.get(username, 0)
 
-        # --- V1 orders: always sells made by seller_id ---
+        # V1: seller gets price * qty
         for o in ORDERS:
             if not o.get("active", True):
                 continue
@@ -119,10 +102,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             if qty <= 0:
                 continue
-            # V1 is always sell at positive price -> user receives price * qty
             balance += price * qty
 
-        # --- V2 orders: buys and sells ---
+        # V2: buy decreases balance, sell increases
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
@@ -138,10 +120,8 @@ class Handler(BaseHTTPRequestHandler):
 
             side = o.get("side")
             if side == "buy":
-                # Buy: user pays price * qty
                 balance -= price * qty
             elif side == "sell":
-                # Sell: user receives price * qty
                 balance += price * qty
 
         return balance
@@ -162,18 +142,12 @@ class Handler(BaseHTTPRequestHandler):
         return [dna[i:i+3] for i in range(0, len(dna), 3)]
 
     def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
-        """
-        Levenshtein distance on codons with a hard cap max_diff.
-        Returns a value > max_diff if distance exceeds max_diff.
-        Uses a banded DP of width ~2*max_diff+1.
-        """
         n = len(ref_codons)
         m = len(sample_codons)
 
         if max_diff < 0:
             return max_diff + 1
 
-        # At least this many insert/delete ops
         if abs(n - m) > max_diff:
             return max_diff + 1
 
@@ -182,9 +156,7 @@ class Handler(BaseHTTPRequestHandler):
         if m == 0:
             return n
 
-        # prev and curr are dicts: j -> cost
         prev = {}
-        # row 0: cost = j (0..min(m, max_diff))
         for j in range(0, min(m, max_diff) + 1):
             prev[j] = j
 
@@ -194,16 +166,13 @@ class Handler(BaseHTTPRequestHandler):
             curr = {}
 
             for j in range(j_min, j_max + 1):
-                # insertion: (i, j-1) -> (i, j)
                 if j > j_min:
                     ins = curr[j - 1] + 1
                 else:
-                    ins = max_diff + 1  # out of band
+                    ins = max_diff + 1
 
-                # deletion: (i-1, j) -> (i, j)
                 dele = prev.get(j, max_diff + 1) + 1
 
-                # substitution / match: (i-1, j-1) -> (i, j)
                 if j - 1 in prev:
                     sub_cost = 0 if ref_codons[i - 1] == sample_codons[j - 1] else 1
                     sub = prev[j - 1] + sub_cost
@@ -225,9 +194,7 @@ class Handler(BaseHTTPRequestHandler):
         sub_codons = self._split_codons(submitted)
 
         ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000  # floor(Ca/100000)
-
-        # If ref is very short, allowed_diff might be 0 -> exact or within 0 edits
+        allowed_diff = ref_count // 100000
         max_diff = allowed_diff
 
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
@@ -236,7 +203,6 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- WebSocket helpers ----------
 
     def _ws_build_binary_frame(self, payload: bytes) -> bytes:
-        # Server-to-client frames are not masked.
         fin_opcode = 0x82  # FIN=1, opcode=2 (binary)
         length = len(payload)
         if length < 126:
@@ -248,7 +214,6 @@ class Handler(BaseHTTPRequestHandler):
         return header + payload
 
     def _broadcast_trade(self, trade: dict):
-        # Only V2 trades should be broadcast; caller ensures this
         if not TRADE_STREAM_CLIENTS:
             return
         payload = encode_message({
@@ -263,7 +228,6 @@ class Handler(BaseHTTPRequestHandler):
         })
         frame = self._ws_build_binary_frame(payload)
 
-        # Send to all connected clients, drop broken ones
         for sock in list(TRADE_STREAM_CLIENTS):
             try:
                 sock.sendall(frame)
@@ -273,10 +237,34 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-    # ---------- bulk-op simulation helpers ----------
+    def _broadcast_order_book_change(self, order: dict, change_type: str):
+        if not ORDER_BOOK_STREAM_CLIENTS:
+            return
+
+        payload = encode_message({
+            "order_id": str(order["order_id"]),
+            "side": order["side"],
+            "price": int(order["price"]),
+            "quantity": int(order["quantity"]),
+            "delivery_start": int(order["delivery_start"]),
+            "delivery_end": int(order["delivery_end"]),
+            "change_type": change_type,  # "ADD" / "MODIFY" / "REMOVE"
+            "timestamp": int(time.time() * 1000),
+        })
+        frame = self._ws_build_binary_frame(payload)
+
+        for sock in list(ORDER_BOOK_STREAM_CLIENTS):
+            try:
+                sock.sendall(frame)
+            except Exception:
+                try:
+                    ORDER_BOOK_STREAM_CLIENTS.remove(sock)
+                except ValueError:
+                    pass
+
+    # ---------- bulk simulation helpers ----------
 
     def _bulk_sim_create(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
-        """Simulate create operation, return validation result with trades if any"""
         try:
             side = (op.get("side") or "").strip()
             price = int(op.get("price"))
@@ -292,38 +280,31 @@ class Handler(BaseHTTPRequestHandler):
         if execution_type not in ("GTC", "IOC", "FOK"):
             return {"ok": False, "status": 400}
 
-        # Check collateral in simulated state
         if not self._check_collateral_in_sim_state(username, side, price, quantity, staged_ops):
             return {"ok": False, "status": 402}
 
         order_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
 
-        # Build hypothetical order book including staged creates/modifies
         sim_book = self._build_sim_order_book(ds, de, staged_ops)
 
-        # Find matching orders
         if side == "buy":
             candidates = [
                 o for o in sim_book
-                if o["side"] == "sell"
-                and o["price"] <= price
+                if o["side"] == "sell" and o["price"] <= price
             ]
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
             candidates = [
                 o for o in sim_book
-                if o["side"] == "buy"
-                and o["price"] >= price
+                if o["side"] == "buy" and o["price"] >= price
             ]
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match check
         for c in candidates:
             if c.get("owner") == username:
                 return {"ok": False, "status": 412}
 
-        # Simulate matching
         remaining = quantity
         filled_quantity = 0
         trades = []
@@ -362,7 +343,6 @@ class Handler(BaseHTTPRequestHandler):
             filled_quantity += trade_qty
             resting["quantity"] -= trade_qty
 
-        # FOK check – must fill fully or cancel with no trades
         if execution_type == "FOK" and remaining > 0:
             return {
                 "ok": True,
@@ -373,7 +353,6 @@ class Handler(BaseHTTPRequestHandler):
                 "trades": [],
             }
 
-        # Determine final status
         if execution_type == "GTC":
             if remaining > 0:
                 status = "ACTIVE"
@@ -394,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
         elif execution_type == "IOC":
             status = "FILLED" if remaining <= 0 else "CANCELLED"
             order_data = None
-        else:  # FOK (fully filled case)
+        else:  # FOK
             status = "FILLED"
             order_data = None
 
@@ -408,7 +387,6 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _bulk_sim_modify(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
-        """Simulate modify operation, return validation result"""
         try:
             order_id = op.get("order_id", "").strip()
             new_price = int(op.get("price"))
@@ -421,51 +399,41 @@ class Handler(BaseHTTPRequestHandler):
         if new_quantity <= 0:
             return {"ok": False, "status": 400}
 
-        # Find order in real book or staged creates
         order = self._find_order_in_sim(order_id, ds, de, staged_ops)
-
         if not order:
             return {"ok": False, "status": 404}
 
         if order.get("owner") != username:
             return {"ok": False, "status": 403}
 
-        # Check if already cancelled in staged ops
         for sop in staged_ops:
             if sop.get("action") == "cancel" and sop.get("order_id") == order_id:
                 return {"ok": False, "status": 404}
 
         side = order["side"]
 
-        # Build sim book
         sim_book = self._build_sim_order_book(ds, de, staged_ops, exclude_order_id=order_id)
 
-        # Find matching orders with new price
         if side == "buy":
             candidates = [
                 o for o in sim_book
-                if o["side"] == "sell"
-                and o["price"] <= new_price
+                if o["side"] == "sell" and o["price"] <= new_price
             ]
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:
             candidates = [
                 o for o in sim_book
-                if o["side"] == "buy"
-                and o["price"] >= new_price
+                if o["side"] == "buy" and o["price"] >= new_price
             ]
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match check
         for c in candidates:
             if c.get("owner") == username:
                 return {"ok": False, "status": 412}
 
-        # Collateral check with new values
         if not self._check_collateral_modify_in_sim(username, order_id, new_price, new_quantity, staged_ops):
             return {"ok": False, "status": 402}
 
-        # Simulate matching
         remaining = new_quantity
         filled_quantity = 0
         trades = []
@@ -526,7 +494,6 @@ class Handler(BaseHTTPRequestHandler):
         return result
 
     def _bulk_sim_cancel(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
-        """Simulate cancel operation, return validation result"""
         try:
             order_id = op.get("order_id", "").strip()
         except Exception:
@@ -535,16 +502,13 @@ class Handler(BaseHTTPRequestHandler):
         if not order_id:
             return {"ok": False, "status": 400}
 
-        # Find order
         order = self._find_order_in_sim(order_id, ds, de, staged_ops)
-
         if not order:
             return {"ok": False, "status": 404}
 
         if order.get("owner") != username:
             return {"ok": False, "status": 403}
 
-        # Check if already cancelled in staged ops
         for sop in staged_ops:
             if sop.get("action") == "cancel" and sop.get("order_id") == order_id:
                 return {"ok": False, "status": 404}
@@ -556,10 +520,8 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _build_sim_order_book(self, ds: int, de: int, staged_ops: list, exclude_order_id: str = None):
-        """Build hypothetical order book including real orders + staged creates/modifies"""
         sim_book = []
 
-        # Start with real active orders
         for o in V2_ORDERS:
             if o.get("status") != "ACTIVE":
                 continue
@@ -570,7 +532,6 @@ class Handler(BaseHTTPRequestHandler):
             if exclude_order_id and o["order_id"] == exclude_order_id:
                 continue
 
-            # Check if this order was modified or cancelled in staged ops
             was_modified = False
             was_cancelled = False
             modified_data = None
@@ -607,7 +568,6 @@ class Handler(BaseHTTPRequestHandler):
                     "created_at": o.get("created_at", 0),
                 })
 
-        # Add staged creates that are ACTIVE
         for sop in staged_ops:
             if sop["action"] == "create" and sop.get("order"):
                 order_data = sop["order"]
@@ -623,14 +583,11 @@ class Handler(BaseHTTPRequestHandler):
         return sim_book
 
     def _find_order_in_sim(self, order_id: str, ds: int, de: int, staged_ops: list):
-        """Find order in real book or staged creates"""
-        # Check staged creates first
         for sop in staged_ops:
             if sop["action"] == "create" and sop.get("order"):
                 if sop["order"]["order_id"] == order_id:
                     return sop["order"]
 
-        # Check real orders
         for o in V2_ORDERS:
             if o["order_id"] == order_id:
                 if o.get("status") != "ACTIVE" or o["quantity"] <= 0:
@@ -642,7 +599,6 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def _check_collateral_in_sim_state(self, username: str, side: str, price: int, quantity: int, staged_ops: list):
-        """Check collateral considering staged operations"""
         coll = COLLATERAL.get(username)
         if coll is None:
             return True
@@ -650,7 +606,6 @@ class Handler(BaseHTTPRequestHandler):
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
 
-        # Compute balance including staged trades
         balance = BALANCES.get(username, 0)
 
         for sop in staged_ops:
@@ -663,7 +618,6 @@ class Handler(BaseHTTPRequestHandler):
                 elif seller == username:
                     balance += amount
 
-        # Include existing active orders
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
@@ -673,14 +627,12 @@ class Handler(BaseHTTPRequestHandler):
             if qty <= 0:
                 continue
 
-            # Check if this order was modified/cancelled in staged ops
             skip = False
             for sop in staged_ops:
                 if sop.get("order_id") == o["order_id"]:
                     if sop["action"] in ("modify", "cancel"):
                         skip = True
                         break
-
             if skip:
                 continue
 
@@ -691,7 +643,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 balance += p * qty
 
-        # Include staged creates/modifies
         for sop in staged_ops:
             if sop["action"] == "create" and sop.get("order"):
                 od = sop["order"]
@@ -704,7 +655,6 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         balance += p * qty
             elif sop["action"] == "modify":
-                # Find original order
                 for o in V2_ORDERS:
                     if o["order_id"] == sop["order_id"] and o["owner"] == username:
                         qty = sop["new_quantity"]
@@ -716,7 +666,6 @@ class Handler(BaseHTTPRequestHandler):
                             balance += p * qty
                         break
 
-        # Now add this new order's effect
         if side == "buy":
             balance -= price * quantity
         else:
@@ -725,12 +674,10 @@ class Handler(BaseHTTPRequestHandler):
         return balance >= -coll
 
     def _check_collateral_modify_in_sim(self, username: str, order_id: str, new_price: int, new_quantity: int, staged_ops: list):
-        """Check collateral for modify in sim state"""
         coll = COLLATERAL.get(username)
         if coll is None:
             return True
 
-        # Find the order being modified
         target_order = None
         for o in V2_ORDERS:
             if o["order_id"] == order_id and o["owner"] == username:
@@ -738,7 +685,6 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
         if not target_order:
-            # Maybe it's a staged create
             for sop in staged_ops:
                 if sop["action"] == "create" and sop.get("order"):
                     if sop["order"]["order_id"] == order_id:
@@ -752,7 +698,6 @@ class Handler(BaseHTTPRequestHandler):
         if not ((side == "buy" and new_price > 0) or (side == "sell" and new_price < 0)):
             return True
 
-        # Compute balance with all staged effects except this modify
         balance = BALANCES.get(username, 0)
 
         for sop in staged_ops:
@@ -765,7 +710,6 @@ class Handler(BaseHTTPRequestHandler):
                 elif seller == username:
                     balance += amount
 
-        # Include existing orders
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
@@ -776,11 +720,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             if o["order_id"] == order_id:
-                # Use new values
                 qty = new_quantity
                 p = new_price
             else:
-                # Check if modified/cancelled
                 skip = False
                 for sop in staged_ops:
                     if sop.get("order_id") == o["order_id"]:
@@ -797,7 +739,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 balance += p * qty
 
-        # Include staged creates/modifies (excluding this one)
         for sop in staged_ops:
             if sop["action"] == "create" and sop.get("order"):
                 od = sop["order"]
@@ -844,8 +785,13 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # NEW: public V2 trades endpoint
             self.handle_v2_trades(parsed)
+
+        elif parsed.path == "/v2/stream/trades":
+            self.handle_trade_stream()
+
+        elif parsed.path == "/v2/stream/order-book":
+            self.handle_order_book_stream()
 
         else:
             self.send_response(404)
@@ -895,7 +841,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    # Override finish so WebSocket connections stay open
     def finish(self):
         try:
             if not self.wfile.closed:
@@ -903,7 +848,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         if getattr(self, "_is_websocket", False):
-            # Do not close socket for WebSocket connections
             return
         try:
             self.wfile.close()
@@ -936,7 +880,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
-
         self._send_no_content(204)
 
     def handle_login(self):
@@ -999,10 +942,107 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- BULK OPERATIONS ----------
+    # ---------- WebSocket endpoints ----------
+
+    def handle_trade_stream(self):
+        if self.command != "GET":
+            self.send_response(405)
+            self.end_headers()
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key")
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        connection = (self.headers.get("Connection") or "").lower()
+
+        if not key or "websocket" not in upgrade or "upgrade" not in connection:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        accept_seed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = base64.b64encode(
+            hashlib.sha1(accept_seed.encode()).digest()
+        ).decode("utf-8")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        self._is_websocket = True
+
+        sock = self.request
+        TRADE_STREAM_CLIENTS.append(sock)
+
+        try:
+            while True:
+                data = sock.recv(1024)
+                if not data:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                TRADE_STREAM_CLIENTS.remove(sock)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def handle_order_book_stream(self):
+        if self.command != "GET":
+            self.send_response(405)
+            self.end_headers()
+            return
+
+        key = self.headers.get("Sec-WebSocket-Key")
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        connection = (self.headers.get("Connection") or "").lower()
+
+        if not key or "websocket" not in upgrade or "upgrade" not in connection:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        accept_seed = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = base64.b64encode(
+            hashlib.sha1(accept_seed.encode("utf-8")).digest()
+        ).decode("utf-8")
+
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+
+        self._is_websocket = True
+
+        sock = self.request
+        ORDER_BOOK_STREAM_CLIENTS.append(sock)
+
+        try:
+            while True:
+                data = sock.recv(1024)
+                if not data:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                ORDER_BOOK_STREAM_CLIENTS.remove(sock)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # ---------- bulk operations ----------
 
     def handle_bulk_operations(self):
-        # ---------- decode ----------
         try:
             body = self._read_body()
             data = decode_message(body)
@@ -1013,7 +1053,6 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(contracts, list) or not contracts:
             return self._send_no_content(400)
 
-        # ---------- stage 1: full validation + dry-run ----------
         staged_operations = []
 
         for contract in contracts:
@@ -1027,14 +1066,12 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(ops, list) or not ops:
                 return self._send_no_content(400)
 
-            # Validate delivery window format
             HOUR_MS = 3600000
             if (ds % HOUR_MS) != 0 or (de % HOUR_MS) != 0:
                 return self._send_no_content(400)
             if de <= ds or de - ds != HOUR_MS:
                 return self._send_no_content(400)
 
-            # Validate trading window
             if not self._check_trading_window(ds):
                 return
 
@@ -1045,7 +1082,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not username:
                     return self._send_no_content(401)
 
-                # Dispatch validation by type
                 if optype == "create":
                     result = self._bulk_sim_create(username, op, ds, de, staged_operations)
                 elif optype == "modify":
@@ -1060,70 +1096,62 @@ class Handler(BaseHTTPRequestHandler):
 
                 staged_operations.append(result)
 
-        # ---------- stage 2: COMMIT ----------
+        # COMMIT
         for result in staged_operations:
             if result["action"] == "create":
                 order_data = result["order"]
-
-                # Only append if there is a resting order (GTC with remaining qty)
                 if order_data is not None and result.get("status") == "ACTIVE":
                     V2_ORDERS.append(order_data)
+                    self._broadcast_order_book_change(order_data, "ADD")
 
-                # Execute trades from matching (also for IOC/FOK)
                 for trade in result.get("trades", []):
                     TRADES.append(trade)
                     self._apply_trade_balances(
                         trade["buyer_id"],
                         trade["seller_id"],
                         trade["price"],
-                        trade["quantity"],
+                        trade["quantity"]
                     )
                     self._broadcast_trade(trade)
 
             elif result["action"] == "modify":
                 order_id = result["order_id"]
-                target = None
-                for o in V2_ORDERS:
-                    if o["order_id"] == order_id:
-                        target = o
-                        break
-                if target:
-                    target["price"] = result["new_price"]
-                    target["quantity"] = result["new_quantity"]
-                    target["status"] = result["status"]
-                    if "created_at" in result:
-                        target["created_at"] = result["created_at"]
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["price"] = result["new_price"]
+                target["quantity"] = result["new_quantity"]
+                target["status"] = result["status"]
+                if "created_at" in result:
+                    target["created_at"] = result["created_at"]
 
-                # Execute trades from matching
+                if target["status"] == "ACTIVE":
+                    self._broadcast_order_book_change(target, "MODIFY")
+                else:
+                    self._broadcast_order_book_change(target, "REMOVE")
+
                 for trade in result.get("trades", []):
                     TRADES.append(trade)
                     self._apply_trade_balances(
                         trade["buyer_id"],
                         trade["seller_id"],
                         trade["price"],
-                        trade["quantity"],
+                        trade["quantity"]
                     )
                     self._broadcast_trade(trade)
 
             elif result["action"] == "cancel":
                 order_id = result["order_id"]
-                target = None
-                for o in V2_ORDERS:
-                    if o["order_id"] == order_id:
-                        target = o
-                        break
-                if target:
-                    target["status"] = "CANCELLED"
-                    target["quantity"] = 0
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["status"] = "CANCELLED"
+                target["quantity"] = 0
+                self._broadcast_order_book_change(target, "REMOVE")
 
-        # ---------- stage 3: build result list ----------
         results = []
         for result in staged_operations:
             entry = {
                 "type": result["action"],
                 "order_id": result["order_id"],
             }
-            if result["action"] == "create" and "status" in result:
+            if "status" in result:
                 entry["status"] = result["status"]
             results.append(entry)
 
@@ -1143,22 +1171,18 @@ class Handler(BaseHTTPRequestHandler):
         password = (data.get("password") or "").strip()
         dna_sample = (data.get("dna_sample") or "").strip()
 
-        # Validate input presence
         if not username or not password or not dna_sample:
             self._send_no_content(400)
             return
 
-        # Check credentials (username/password)
         if USERS.get(username) != password:
             self._send_no_content(401)
             return
 
-        # Validate DNA format
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Register DNA; duplicate samples are fine (idempotent)
         samples = DNA_SAMPLES.setdefault(username, [])
         if dna_sample not in samples:
             samples.append(dna_sample)
@@ -1176,12 +1200,10 @@ class Handler(BaseHTTPRequestHandler):
         username = (data.get("username") or "").strip()
         dna_sample = (data.get("dna_sample") or "").strip()
 
-        # Validate input presence
         if not username or not dna_sample:
             self._send_no_content(400)
             return
 
-        # User must exist and have DNA registered
         if username not in USERS:
             self._send_no_content(401)
             return
@@ -1190,12 +1212,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Validate DNA format
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Compare against all reference samples
         matched = False
         for ref in DNA_SAMPLES[username]:
             if self._dna_matches(ref, dna_sample):
@@ -1206,7 +1226,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Success → issue token just like /login
         token = uuid.uuid4().hex
         TOKENS[token] = username
 
@@ -1302,8 +1321,7 @@ class Handler(BaseHTTPRequestHandler):
     def _check_collateral_create(self, username: str, side: str, price: int, quantity: int) -> bool:
         coll = COLLATERAL.get(username)
         if coll is None:
-            return True  # unlimited
-        # Only check orders that can reduce balance
+            return True
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
         base = self._compute_potential_balance(username)
@@ -1319,7 +1337,6 @@ class Handler(BaseHTTPRequestHandler):
         if coll is None:
             return True
 
-        # Recompute potential balance assuming the target order has (new_price, new_quantity)
         base = BALANCES.get(username, 0)
         side_for_target = None
 
@@ -1346,7 +1363,6 @@ class Handler(BaseHTTPRequestHandler):
                 base += price * qty
 
         if side_for_target is None:
-            # Order not found as active – let other logic handle 404
             return True
 
         if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
@@ -1406,7 +1422,6 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_trading_window(delivery_start):
             return
 
-        # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -1419,7 +1434,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
-        # Build candidate list on opposite side
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -1430,9 +1444,8 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
-            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
+        else:
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -1442,16 +1455,13 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
-            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match prevention BEFORE any trades / book changes
         for resting in candidates:
             if resting.get("owner") == username:
                 self._send_no_content(412)
                 return
 
-        # FOK: dry-run to see if full quantity can be filled immediately
         if execution_type == "FOK":
             total_possible = 0
             for resting in candidates:
@@ -1462,7 +1472,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
             if total_possible < quantity:
-                # Cannot fully fill -> cancel, no trades, no book entry
                 self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
@@ -1470,7 +1479,6 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-        # Matching loop (used by all types once we've passed FOK dry-run)
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -1489,7 +1497,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]  # maker price
+            trade_price = resting["price"]
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -1502,13 +1510,10 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
-
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
-
-            # Broadcast to stream subscribers
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
@@ -1518,12 +1523,14 @@ class Handler(BaseHTTPRequestHandler):
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
+                self._broadcast_order_book_change(resting, "REMOVE")
+            else:
+                self._broadcast_order_book_change(resting, "MODIFY")
 
-        # Decide final status and whether order goes into book
         if execution_type == "GTC":
             if remaining > 0:
                 status = "ACTIVE"
-                V2_ORDERS.append({
+                new_order = {
                     "order_id": order_id,
                     "side": side,
                     "owner": username,
@@ -1533,15 +1540,14 @@ class Handler(BaseHTTPRequestHandler):
                     "delivery_end": delivery_end,
                     "status": "ACTIVE",
                     "created_at": now_ms,
-                })
+                }
+                V2_ORDERS.append(new_order)
+                self._broadcast_order_book_change(new_order, "ADD")
             else:
                 status = "FILLED"
         elif execution_type == "IOC":
-            # Never go into book; remaining is cancelled
             status = "FILLED" if remaining <= 0 else "CANCELLED"
-        else:  # FOK
-            # We already ensured via dry-run that we can fully fill
-            # so remaining should be 0 here.
+        else:
             status = "FILLED"
 
         self._send_gbuf(200, {
@@ -1598,7 +1604,6 @@ class Handler(BaseHTTPRequestHandler):
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
-        # Self-match prevention: compute candidates with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -1629,7 +1634,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(412)
                 return
 
-        # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -1639,7 +1643,6 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
-        # Apply modifications
         order["price"] = new_price
         order["quantity"] = new_quantity
 
@@ -1650,7 +1653,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = order["quantity"]
         filled_quantity = 0
 
-        # Matching loop using precomputed candidates
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -1686,7 +1688,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -1698,11 +1700,19 @@ class Handler(BaseHTTPRequestHandler):
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
+                self._broadcast_order_book_change(resting, "REMOVE")
+            else:
+                self._broadcast_order_book_change(resting, "MODIFY")
 
         order["quantity"] = remaining
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
+
+        if order["status"] == "ACTIVE":
+            self._broadcast_order_book_change(order, "MODIFY")
+        else:
+            self._broadcast_order_book_change(order, "REMOVE")
 
         self._send_gbuf(200, {
             "order_id": order["order_id"],
@@ -1733,6 +1743,8 @@ class Handler(BaseHTTPRequestHandler):
         order["status"] = "CANCELLED"
         order["quantity"] = 0
 
+        self._broadcast_order_book_change(order, "REMOVE")
+
         self._send_no_content(204)
 
     # ---------- V2 order book / my-orders / my-trades ----------
@@ -1758,7 +1770,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Trading window: outside window → empty orderbook
         OPEN_MS = 15 * 24 * 60 * 60 * 1000
         CLOSE_MS = 60 * 1000
         now_ms = int(time.time() * 1000)
@@ -1791,9 +1802,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
-        # Bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
-        # Asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -1887,7 +1896,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1904,8 +1913,6 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"trades": trades_payload})
-
-    # ---------- NEW: public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
@@ -1928,7 +1935,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Filter only V2 trades for the given contract
         v2_trades = [
             t for t in TRADES
             if t.get("source") == "v2"
@@ -1953,7 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- V1 take order (creates trades, updates balance) ----------
+    # ---------- V1 take order ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -1997,7 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
-            "source": "v1",  # mark as V1 trade
+            "source": "v1",
         }
         TRADES.append(trade)
 
@@ -2008,7 +2014,6 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- collateral endpoints ----------
 
     def handle_set_collateral(self, username: str):
-        # Admin-only: Authorization: Bearer password123
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             self._send_no_content(401)
@@ -2056,8 +2061,7 @@ class Handler(BaseHTTPRequestHandler):
         potential = self._compute_potential_balance(username)
         collateral = COLLATERAL.get(username)
         if collateral is None:
-            # unlimited collateral – represent as a very large int
-            collateral = 9223372036854775807  # 2^63 - 1
+            collateral = 9223372036854775807
 
         self._send_gbuf(200, {
             "balance": int(balance),
@@ -2067,7 +2071,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run():
-    server = HTTPServer(("", 8080), Handler)
+    server = ThreadingHTTPServer(("", 8080), Handler)
     print("Server running on port 8080...")
     server.serve_forever()
 
