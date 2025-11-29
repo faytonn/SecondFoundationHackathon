@@ -214,13 +214,6 @@ class Handler(BaseHTTPRequestHandler):
             header = bytes([fin_opcode, 127]) + length.to_bytes(8, "big")
         return header + payload
 
-    def _ws_build_close_frame(self, code: int) -> bytes:
-        payload = code.to_bytes(2, "big")
-        fin_opcode = 0x88  # FIN=1, opcode=8 (close)
-        length = len(payload)
-        header = bytes([fin_opcode, length])
-        return header + payload
-
     def _broadcast_trade(self, trade: dict):
         if not TRADE_STREAM_CLIENTS:
             return
@@ -270,45 +263,49 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
-    def _broadcast_execution_report(
-        self,
-        username: str,
-        order_id: str,
-        status: str,
-        side: str,
-        price: int,
-        filled_quantity: int,
-        remaining_quantity: int,
-        delivery_start: int,
-        delivery_end: int,
-    ):
+    def _broadcast_execution_report(self, owner: str, report: dict):
         if not EXECUTION_REPORT_STREAM_CLIENTS:
             return
-
-        payload = encode_message({
-            "order_id": str(order_id),
-            "status": status,
-            "side": side,
-            "price": int(price),
-            "filled_quantity": int(filled_quantity),
-            "remaining_quantity": int(remaining_quantity),
-            "delivery_start": int(delivery_start),
-            "delivery_end": int(delivery_end),
-            "timestamp": int(time.time() * 1000),
-        })
+        payload = encode_message(report)
         frame = self._ws_build_binary_frame(payload)
-
-        for client in list(EXECUTION_REPORT_STREAM_CLIENTS):
-            if client["username"] != username:
+        for sock, username in list(EXECUTION_REPORT_STREAM_CLIENTS):
+            if username != owner:
                 continue
-            sock = client["sock"]
             try:
                 sock.sendall(frame)
             except Exception:
                 try:
-                    EXECUTION_REPORT_STREAM_CLIENTS.remove(client)
+                    EXECUTION_REPORT_STREAM_CLIENTS.remove((sock, username))
                 except ValueError:
                     pass
+
+    def _send_execution_report_for_order(self, order, timestamp=None):
+        owner = order.get("owner")
+        if not owner:
+            return
+        if timestamp is None:
+            timestamp = int(time.time() * 1000)
+
+        status = order.get("status", "ACTIVE")
+        side = order.get("side")
+        price = int(order.get("price", 0))
+        filled = int(order.get("filled_quantity", 0))
+        remaining = int(order.get("quantity", 0))
+        ds = int(order.get("delivery_start", 0))
+        de = int(order.get("delivery_end", 0))
+
+        report = {
+            "order_id": str(order.get("order_id", "")),
+            "status": status,
+            "side": side,
+            "price": price,
+            "filled_quantity": filled,
+            "remaining_quantity": remaining,
+            "delivery_start": ds,
+            "delivery_end": de,
+            "timestamp": int(timestamp),
+        }
+        self._broadcast_execution_report(owner, report)
 
     # ---------- bulk simulation helpers ----------
 
@@ -421,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
         elif execution_type == "IOC":
             status = "FILLED" if remaining <= 0 else "CANCELLED"
             order_data = None
-        else:  # FOK
+        else:
             status = "FILLED"
             order_data = None
 
@@ -1098,7 +1095,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         qs = parse_qs(parsed.query)
-        token = qs.get("token", [None])[0]
+        token = ""
+        if "token" in qs and qs["token"]:
+            token = (qs["token"][0] or "").strip()
+        username = TOKENS.get(token)
 
         key = self.headers.get("Sec-WebSocket-Key")
         upgrade = (self.headers.get("Upgrade") or "").lower()
@@ -1123,10 +1123,10 @@ class Handler(BaseHTTPRequestHandler):
         self._is_websocket = True
         sock = self.request
 
-        username = TOKENS.get(token) if token else None
         if not username:
+            close_payload = (1008).to_bytes(2, "big")
+            frame = bytes([0x88, 0x02]) + close_payload
             try:
-                frame = self._ws_build_close_frame(1008)
                 sock.sendall(frame)
             except Exception:
                 pass
@@ -1136,7 +1136,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
-        EXECUTION_REPORT_STREAM_CLIENTS.append({"sock": sock, "username": username})
+        EXECUTION_REPORT_STREAM_CLIENTS.append((sock, username))
 
         try:
             while True:
@@ -1147,9 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             try:
-                EXECUTION_REPORT_STREAM_CLIENTS[:] = [
-                    c for c in EXECUTION_REPORT_STREAM_CLIENTS if c["sock"] is not sock
-                ]
+                EXECUTION_REPORT_STREAM_CLIENTS.remove((sock, username))
             except Exception:
                 pass
             try:
@@ -1213,6 +1211,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 staged_operations.append(result)
 
+        # COMMIT
         for result in staged_operations:
             if result["action"] == "create":
                 order_data = result["order"]
@@ -1547,21 +1546,21 @@ class Handler(BaseHTTPRequestHandler):
         order_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
 
-        # Submission execution report (ACTIVE, filled=0)
-        self._broadcast_execution_report(
-            username=username,
-            order_id=order_id,
-            status="ACTIVE",
-            side=side,
-            price=price,
-            filled_quantity=0,
-            remaining_quantity=quantity,
-            delivery_start=delivery_start,
-            delivery_end=delivery_end,
-        )
-
         remaining = quantity
-        taker_filled = 0
+        filled_quantity = 0
+
+        incoming_order = {
+            "order_id": order_id,
+            "side": side,
+            "owner": username,
+            "price": price,
+            "quantity": remaining,
+            "delivery_start": delivery_start,
+            "delivery_end": delivery_end,
+            "status": "ACTIVE",
+            "created_at": now_ms,
+            "filled_quantity": 0,
+        }
 
         if side == "buy":
             candidates = [
@@ -1601,17 +1600,10 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
             if total_possible < quantity:
-                self._broadcast_execution_report(
-                    username=username,
-                    order_id=order_id,
-                    status="CANCELLED",
-                    side=side,
-                    price=price,
-                    filled_quantity=0,
-                    remaining_quantity=quantity,
-                    delivery_start=delivery_start,
-                    delivery_end=delivery_end,
-                )
+                incoming_order["status"] = "CANCELLED"
+                incoming_order["filled_quantity"] = 0
+                incoming_order["quantity"] = quantity
+                self._send_execution_report_for_order(incoming_order)
                 self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
@@ -1619,16 +1611,13 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
+        self._send_execution_report_for_order(incoming_order)
+
         for resting in candidates:
             if remaining <= 0:
                 break
 
             if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
-                continue
-
-            if side == "buy" and price < resting["price"]:
-                continue
-            if side == "sell" and price > resting["price"]:
                 continue
 
             trade_qty = min(remaining, resting["quantity"])
@@ -1662,10 +1651,16 @@ class Handler(BaseHTTPRequestHandler):
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
-            taker_filled += trade_qty
+            filled_quantity += trade_qty
+
+            incoming_order["quantity"] = remaining
+            incoming_order["filled_quantity"] = filled_quantity
+            self._send_execution_report_for_order(incoming_order, timestamp=ts)
 
             resting["quantity"] -= trade_qty
-            resting["filled_quantity"] = resting.get("filled_quantity", 0) + trade_qty
+            rest_filled = resting.get("filled_quantity", 0) + trade_qty
+            resting["filled_quantity"] = rest_filled
+
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
@@ -1673,68 +1668,35 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._broadcast_order_book_change(resting, "MODIFY")
 
-            self._broadcast_execution_report(
-                username=resting["owner"],
-                order_id=resting["order_id"],
-                status=resting["status"],
-                side=resting["side"],
-                price=resting["price"],
-                filled_quantity=resting.get("filled_quantity", 0),
-                remaining_quantity=resting["quantity"],
-                delivery_start=resting["delivery_start"],
-                delivery_end=resting["delivery_end"],
-            )
-
-            taker_status = "ACTIVE" if remaining > 0 else "FILLED"
-            self._broadcast_execution_report(
-                username=username,
-                order_id=order_id,
-                status=taker_status,
-                side=side,
-                price=price,
-                filled_quantity=taker_filled,
-                remaining_quantity=remaining,
-                delivery_start=delivery_start,
-                delivery_end=delivery_end,
-            )
-
-        filled_quantity = taker_filled
+            self._send_execution_report_for_order(resting, timestamp=ts)
 
         if execution_type == "GTC":
             if remaining > 0:
                 status = "ACTIVE"
-                new_order = {
-                    "order_id": order_id,
-                    "side": side,
-                    "owner": username,
-                    "price": price,
-                    "quantity": remaining,
-                    "delivery_start": delivery_start,
-                    "delivery_end": delivery_end,
-                    "status": "ACTIVE",
-                    "created_at": now_ms,
-                    "filled_quantity": filled_quantity,
-                }
-                V2_ORDERS.append(new_order)
-                self._broadcast_order_book_change(new_order, "ADD")
+                incoming_order["status"] = "ACTIVE"
+                incoming_order["quantity"] = remaining
+                incoming_order["filled_quantity"] = filled_quantity
+                V2_ORDERS.append(incoming_order)
+                self._broadcast_order_book_change(incoming_order, "ADD")
+                self._send_execution_report_for_order(incoming_order)
             else:
                 status = "FILLED"
+                incoming_order["status"] = "FILLED"
+                incoming_order["quantity"] = 0
+                incoming_order["filled_quantity"] = filled_quantity
+                self._send_execution_report_for_order(incoming_order)
         elif execution_type == "IOC":
             status = "FILLED" if remaining <= 0 else "CANCELLED"
-            if remaining > 0:
-                self._broadcast_execution_report(
-                    username=username,
-                    order_id=order_id,
-                    status="CANCELLED",
-                    side=side,
-                    price=price,
-                    filled_quantity=filled_quantity,
-                    remaining_quantity=remaining,
-                    delivery_start=delivery_start,
-                    delivery_end=delivery_end,
-                )
-        else:  # FOK success path (unsuccessful already returned)
+            incoming_order["status"] = status
+            incoming_order["quantity"] = 0 if status == "FILLED" else remaining
+            incoming_order["filled_quantity"] = filled_quantity
+            self._send_execution_report_for_order(incoming_order)
+        else:
             status = "FILLED"
+            incoming_order["status"] = "FILLED"
+            incoming_order["quantity"] = 0
+            incoming_order["filled_quantity"] = filled_quantity
+            self._send_execution_report_for_order(incoming_order)
 
         self._send_gbuf(200, {
             "order_id": order_id,
@@ -1828,6 +1790,7 @@ class Handler(BaseHTTPRequestHandler):
 
         old_price = order["price"]
         old_quantity = order["quantity"]
+        prev_filled = int(order.get("filled_quantity", 0))
 
         order["price"] = new_price
         order["quantity"] = new_quantity
@@ -1836,20 +1799,10 @@ class Handler(BaseHTTPRequestHandler):
         if new_price != old_price or new_quantity > old_quantity:
             order["created_at"] = now_ms
 
-        self._broadcast_execution_report(
-            username=username,
-            order_id=order["order_id"],
-            status="ACTIVE",
-            side=side,
-            price=new_price,
-            filled_quantity=order.get("filled_quantity", 0),
-            remaining_quantity=order["quantity"],
-            delivery_start=delivery_start,
-            delivery_end=delivery_end,
-        )
+        self._send_execution_report_for_order(order, timestamp=now_ms)
 
         remaining = order["quantity"]
-        filled_quantity = 0
+        additional_filled = 0
 
         for resting in candidates:
             if remaining <= 0:
@@ -1893,12 +1846,15 @@ class Handler(BaseHTTPRequestHandler):
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
-            filled_quantity += trade_qty
+            additional_filled += trade_qty
+
+            order["quantity"] = remaining
+            order["filled_quantity"] = prev_filled + additional_filled
+            self._send_execution_report_for_order(order, timestamp=ts)
+
             resting["quantity"] -= trade_qty
-
-            order["filled_quantity"] = order.get("filled_quantity", 0) + trade_qty
-            resting["filled_quantity"] = resting.get("filled_quantity", 0) + trade_qty
-
+            rest_filled = resting.get("filled_quantity", 0) + trade_qty
+            resting["filled_quantity"] = rest_filled
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
@@ -1906,59 +1862,26 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._broadcast_order_book_change(resting, "MODIFY")
 
-            self._broadcast_execution_report(
-                username=resting["owner"],
-                order_id=resting["order_id"],
-                status=resting["status"],
-                side=resting["side"],
-                price=resting["price"],
-                filled_quantity=resting.get("filled_quantity", 0),
-                remaining_quantity=resting["quantity"],
-                delivery_start=resting["delivery_start"],
-                delivery_end=resting["delivery_end"],
-            )
-
-            order_status = "ACTIVE" if remaining > 0 else "FILLED"
-            self._broadcast_execution_report(
-                username=username,
-                order_id=order["order_id"],
-                status=order_status,
-                side=side,
-                price=order["price"],
-                filled_quantity=order.get("filled_quantity", 0),
-                remaining_quantity=remaining,
-                delivery_start=delivery_start,
-                delivery_end=delivery_end,
-            )
+            self._send_execution_report_for_order(resting, timestamp=ts)
 
         order["quantity"] = remaining
+        total_filled = prev_filled + additional_filled
+        order["filled_quantity"] = total_filled
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
-        else:
-            order["status"] = "ACTIVE"
 
         if order["status"] == "ACTIVE":
             self._broadcast_order_book_change(order, "MODIFY")
         else:
             self._broadcast_order_book_change(order, "REMOVE")
 
-        self._broadcast_execution_report(
-            username=username,
-            order_id=order["order_id"],
-            status=order["status"],
-            side=side,
-            price=order["price"],
-            filled_quantity=order.get("filled_quantity", 0),
-            remaining_quantity=order["quantity"],
-            delivery_start=delivery_start,
-            delivery_end=delivery_end,
-        )
+        self._send_execution_report_for_order(order)
 
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
-            "filled_quantity": filled_quantity,
+            "filled_quantity": additional_filled,
         })
 
     def handle_cancel_order(self, order_id: str):
@@ -1981,23 +1904,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(403)
             return
 
+        remaining = order["quantity"]
         order["status"] = "CANCELLED"
-        remaining_before = order["quantity"]
-        order["quantity"] = 0
+        order["quantity"] = remaining
 
         self._broadcast_order_book_change(order, "REMOVE")
-
-        self._broadcast_execution_report(
-            username=username,
-            order_id=order["order_id"],
-            status="CANCELLED",
-            side=order["side"],
-            price=order["price"],
-            filled_quantity=order.get("filled_quantity", 0),
-            remaining_quantity=remaining_before,
-            delivery_start=order["delivery_start"],
-            delivery_end=order["delivery_end"],
-        )
+        self._send_execution_report_for_order(order)
 
         self._send_no_content(204)
 
