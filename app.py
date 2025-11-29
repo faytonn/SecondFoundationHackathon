@@ -1075,12 +1075,24 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_trading_window(ds):
                 return
 
-            for op in ops:
-                optype = op.get("type")
-                token = op.get("participant_token", "")
-                username = TOKENS.get(token)
-                if not username:
-                    return self._send_no_content(401)
+          for op in ops:
+            optype = op.get("type")
+        
+            # --- robust participant_token handling ---
+            raw_token = op.get("participant_token")
+            if isinstance(raw_token, bytes):
+                raw_token = raw_token.decode("utf-8", errors="ignore")
+        
+            token = (raw_token or "").strip()
+            if token.startswith("Bearer "):
+                token = token[7:].strip()
+        
+            username = TOKENS.get(token)
+            if not username:
+                # No valid auth for this operation -> whole bulk fails
+                return self._send_no_content(401)
+            # --- end token handling ---
+
 
                 if optype == "create":
                     result = self._bulk_sim_create(username, op, ds, de, staged_operations)
