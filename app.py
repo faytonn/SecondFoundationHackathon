@@ -11,53 +11,14 @@ ORDERS = []
 V2_ORDERS = []
 TRADES = []
 
-# username -> list of DNA samples (strings)
-DNA_DB = {}
-
-
-# ---------- DNA HELPERS (shared) ----------
-
-def is_valid_dna(seq: str) -> bool:
-    if not seq:
-        return False
-    if len(seq) % 3 != 0:
-        return False
-    allowed_chars = {"C", "G", "A", "T"}
-    return all(c in allowed_chars for c in seq)
-
-
-def codon_edit_distance(a: str, b: str) -> int:
-    """
-    Compute Levenshtein distance between two DNA sequences
-    at the codon level (3-character groups).
-    Operations: insertion, deletion, substitution (cost=1).
-    """
-    codons_a = [a[i:i+3] for i in range(0, len(a), 3)]
-    codons_b = [b[i:i+3] for i in range(0, len(b), 3)]
-
-    n = len(codons_a)
-    m = len(codons_b)
-
-    prev = list(range(m + 1))
-    curr = [0] * (m + 1)
-
-    for i in range(1, n + 1):
-        curr[0] = i
-        ca = codons_a[i - 1]
-        for j in range(1, m + 1):
-            cb = codons_b[j - 1]
-            cost = 0 if ca == cb else 1
-            curr[j] = min(
-                prev[j] + 1,       # deletion
-                curr[j - 1] + 1,   # insertion
-                prev[j - 1] + cost # substitution
-            )
-        prev, curr = curr, prev
-
-    return prev[m]
+# New: balances + collateral
+BALANCES = {}     # username -> int
+COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
 
 class Handler(BaseHTTPRequestHandler):
+    # ---------- helpers ----------
+
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
@@ -86,7 +47,40 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return TOKENS.get(token)
 
-    # ---------- HTTP METHODS ----------
+    # ----- balances / collateral helpers -----
+
+    def _apply_trade_balances(self, buyer_id: str, seller_id: str, price: int, quantity: int):
+        """
+        Buyer pays price * quantity, seller receives price * quantity.
+        Negative prices will naturally invert the effect.
+        """
+        amount = int(price) * int(quantity)
+        BALANCES[buyer_id] = BALANCES.get(buyer_id, 0) - amount
+        BALANCES[seller_id] = BALANCES.get(seller_id, 0) + amount
+
+    def _compute_potential_balance(self, username: str) -> int:
+        """
+        Potential balance = current balance + effect if all ACTIVE V2 orders fill.
+        Buy -> pays price * qty (subtract)
+        Sell -> receives price * qty (add)
+        """
+        balance = BALANCES.get(username, 0)
+        for o in V2_ORDERS:
+            if o.get("owner") != username:
+                continue
+            if o.get("status") != "ACTIVE":
+                continue
+            qty = int(o.get("quantity", 0))
+            if qty <= 0:
+                continue
+            price = int(o["price"])
+            if o["side"] == "buy":
+                balance -= price * qty
+            else:
+                balance += price * qty
+        return balance
+
+    # ---------- HTTP methods ----------
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -111,6 +105,12 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/v2/my-orders":
             self.handle_my_orders()
 
+        elif parsed.path == "/v2/my-trades":
+            self.handle_my_trades(parsed)
+
+        elif parsed.path == "/balance":
+            self.handle_get_balance()
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -126,10 +126,11 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_submit_order_v2()
         elif self.path == "/trades":
             self.handle_take_order()
-        elif self.path == "/dna-submit":
-            self.handle_dna_submit()
-        elif self.path == "/dna-login":
-            self.handle_dna_login()
+        elif self.path == "/v2/bulk-operations":
+            # You can implement this later – for now just not implemented.
+            self.send_response(501)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -141,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/v2/orders/"):
             order_id = parsed.path.split("/")[-1]
             self.handle_modify_order(order_id)
+        elif parsed.path.startswith("/collateral/"):
+            username = parsed.path.split("/")[-1]
+            self.handle_set_collateral(username)
         else:
             self.send_response(404)
             self.end_headers()
@@ -154,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    # ---------- AUTH & USERS ----------
+    # ---------- auth & users ----------
 
     def handle_register(self):
         try:
@@ -238,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- V1 ORDERS ----------
+    # ---------- V1 orders & trades ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -323,7 +327,64 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"order_id": order_id})
 
-    # ---------- V2: SUBMIT + MATCHING ----------
+    # ---------- collateral checks ----------
+
+    def _check_collateral_create(self, username: str, side: str, price: int, quantity: int) -> bool:
+        coll = COLLATERAL.get(username)
+        if coll is None:
+            return True  # unlimited
+        # Only check orders that can reduce balance
+        if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
+            return True
+        base = self._compute_potential_balance(username)
+        if side == "buy":
+            delta = -price * quantity
+        else:
+            delta = price * quantity
+        potential_after = base + delta
+        return potential_after >= -coll
+
+    def _check_collateral_modify(self, username: str, order_id: str, new_price: int, new_quantity: int) -> bool:
+        coll = COLLATERAL.get(username)
+        if coll is None:
+            return True
+
+        # Recompute potential balance assuming the target order has (new_price, new_quantity)
+        base = BALANCES.get(username, 0)
+        side_for_target = None
+
+        for o in V2_ORDERS:
+            if o.get("owner") != username:
+                continue
+            if o.get("status") != "ACTIVE":
+                continue
+            qty = int(o.get("quantity", 0))
+            if qty <= 0:
+                continue
+            price = int(o["price"])
+            side = o["side"]
+
+            if o.get("order_id") == order_id:
+                qty = new_quantity
+                price = new_price
+                side = o["side"]
+                side_for_target = side
+
+            if side == "buy":
+                base -= price * qty
+            else:
+                base += price * qty
+
+        if side_for_target is None:
+            # Order not found as active – let other logic handle 404
+            return True
+
+        if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
+            return True
+
+        return base >= -coll
+
+    # ---------- V2 submit (matching engine) ----------
 
     def handle_submit_order_v2(self):
         username = self._get_authenticated_user()
@@ -360,8 +421,18 @@ class Handler(BaseHTTPRequestHandler):
         if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
             self._send_no_content(400)
             return
-        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+        if delivery_end <= delivery_start:
             self._send_no_content(400)
+            return
+        if delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        # Collateral check BEFORE matching/adding order
+        if not self._check_collateral_create(username, side, price, quantity):
+            self.send_response(402)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         order_id = uuid.uuid4().hex
@@ -370,6 +441,7 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
+        # Build candidate list on opposite side
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -380,8 +452,9 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
+            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:
+        else:  # sell
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -391,11 +464,20 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
+            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
+        # Self-match prevention BEFORE any trades / book changes
+        for resting in candidates:
+            if resting.get("owner") == username:
+                self._send_no_content(412)
+                return
+
+        # Matching loop
         for resting in candidates:
             if remaining <= 0:
                 break
+
             if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
                 continue
 
@@ -410,18 +492,22 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]
+            trade_price = resting["price"]  # maker price
             trade_id = uuid.uuid4().hex
-            trade_ts = int(time.time() * 1000)
+            ts = int(time.time() * 1000)
 
-            TRADES.append({
+            trade = {
                 "trade_id": trade_id,
                 "buyer_id": buyer_id,
                 "seller_id": seller_id,
                 "price": trade_price,
                 "quantity": trade_qty,
-                "timestamp": trade_ts,
-            })
+                "timestamp": ts,
+                "delivery_start": delivery_start,
+                "delivery_end": delivery_end,
+            }
+            TRADES.append(trade)
+            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
 
             remaining -= trade_qty
             filled_quantity += trade_qty
@@ -452,6 +538,8 @@ class Handler(BaseHTTPRequestHandler):
             "status": status,
             "filled_quantity": filled_quantity,
         })
+
+    # ---------- V2 modify / cancel ----------
 
     def handle_modify_order(self, order_id: str):
         username = self._get_authenticated_user()
@@ -487,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
                 order = o
                 break
 
-        if not order or order.get("status", "ACTIVE") != "ACTIVE" or order["quantity"] <= 0:
+        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
             self._send_no_content(404)
             return
 
@@ -495,27 +583,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(403)
             return
 
-        old_price = order["price"]
-        old_quantity = order["quantity"]
-
-        order["price"] = new_price
-        order["quantity"] = new_quantity
-
-        now_ms = int(time.time() * 1000)
-        if new_price != old_price or new_quantity > old_quantity:
-            order["created_at"] = now_ms
-
         side = order["side"]
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
-        remaining = order["quantity"]
-        filled_quantity = 0
-
+        # Self-match prevention: compute candidates with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
+                if o.get("status") == "ACTIVE"
                 and o["side"] == "sell"
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
@@ -527,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             candidates = [
                 o for o in V2_ORDERS
-                if o.get("status", "ACTIVE") == "ACTIVE"
+                if o.get("status") == "ACTIVE"
                 and o["side"] == "buy"
                 and o["delivery_start"] == delivery_start
                 and o["delivery_end"] == delivery_end
@@ -538,11 +614,36 @@ class Handler(BaseHTTPRequestHandler):
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
         for resting in candidates:
+            if resting.get("owner") == username:
+                self._send_no_content(412)
+                return
+
+        # Collateral check with new values
+        if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
+            self.send_response(402)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        old_price = order["price"]
+        old_quantity = order["quantity"]
+
+        # Apply modifications
+        order["price"] = new_price
+        order["quantity"] = new_quantity
+
+        now_ms = int(time.time() * 1000)
+        if new_price != old_price or new_quantity > old_quantity:
+            order["created_at"] = now_ms
+
+        remaining = order["quantity"]
+        filled_quantity = 0
+
+        # Matching loop using precomputed candidates
+        for resting in candidates:
             if remaining <= 0:
                 break
-            if resting.get("status", "ACTIVE") != "ACTIVE":
-                continue
-            if resting["quantity"] <= 0:
+            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
                 continue
 
             if side == "buy" and new_price < resting["price"]:
@@ -565,14 +666,18 @@ class Handler(BaseHTTPRequestHandler):
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
-            TRADES.append({
+            trade = {
                 "trade_id": trade_id,
                 "buyer_id": buyer_id,
                 "seller_id": seller_id,
                 "price": trade_price,
                 "quantity": trade_qty,
                 "timestamp": ts,
-            })
+                "delivery_start": delivery_start,
+                "delivery_end": delivery_end,
+            }
+            TRADES.append(trade)
+            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
 
             remaining -= trade_qty
             filled_quantity += trade_qty
@@ -617,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_no_content(204)
 
-    # ---------- V2 ORDER BOOK & MY ORDERS ----------
+    # ---------- V2 order book / my-orders / my-trades ----------
 
     def handle_v2_order_book(self, parsed):
         qs = parse_qs(parsed.query)
@@ -662,7 +767,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
+        # Bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
+        # Asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -699,7 +806,64 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"orders": orders_payload})
 
-    # ---------- TRADES (V1) ----------
+    def handle_my_trades(self, parsed):
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        qs = parse_qs(parsed.query)
+        if "delivery_start" not in qs or "delivery_end" not in qs:
+            self._send_no_content(400)
+            return
+
+        try:
+            delivery_start = int(qs["delivery_start"][0])
+            delivery_end = int(qs["delivery_end"][0])
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            self._send_no_content(400)
+            return
+        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        my_trades = []
+        for t in TRADES:
+            if t.get("delivery_start") != delivery_start or t.get("delivery_end") != delivery_end:
+                continue
+            buyer = t["buyer_id"]
+            seller = t["seller_id"]
+            if buyer != username and seller != username:
+                continue
+
+            if buyer == username:
+                side = "buy"
+                counterparty = seller
+            else:
+                side = "sell"
+                counterparty = buyer
+
+            my_trades.append({
+                "trade_id": t["trade_id"],
+                "side": side,
+                "price": int(t["price"]),
+                "quantity": int(t["quantity"]),
+                "counterparty": counterparty,
+                "delivery_start": int(t["delivery_start"]),
+                "delivery_end": int(t["delivery_end"]),
+                "timestamp": int(t["timestamp"]),
+            })
+
+        my_trades.sort(key=lambda tr: tr["timestamp"], reverse=True)
+
+        self._send_gbuf(200, {"trades": my_trades})
+
+    # ---------- public trades (unchanged, still global feed) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -716,6 +880,8 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_gbuf(200, {"trades": trades_payload})
+
+    # ---------- V1 take order (creates trades, updates balance) ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -757,120 +923,74 @@ class Handler(BaseHTTPRequestHandler):
             "price": int(order["price"]),
             "quantity": int(order["quantity"]),
             "timestamp": now_ms,
+            "delivery_start": int(order["delivery_start"]),
+            "delivery_end": int(order["delivery_end"]),
         }
         TRADES.append(trade)
 
+        self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
+
         self._send_gbuf(200, {"trade_id": trade_id})
 
-    # ---------- DNA ENDPOINTS ----------
+    # ---------- collateral endpoints ----------
 
-    def handle_dna_submit(self):
-        """
-        POST /dna-submit
-        GalacticBuf body:
-          username (string)
-          password (string)
-          dna_sample (string)
-
-        - 400: invalid input or invalid DNA
-        - 401: wrong username/password
-        - 204: success
-        """
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        username = (data.get("username") or "").strip()
-        password = (data.get("password") or "")
-        dna_sample = (data.get("dna_sample") or "").strip()
-
-        if not username or not password or not dna_sample:
-            self._send_no_content(400)
-            return
-
-        if not is_valid_dna(dna_sample):
-            self._send_no_content(400)
-            return
-
-        user_password = USERS.get(username)
-        if user_password is None:
+    def handle_set_collateral(self, username: str):
+        # Admin-only: Authorization: Bearer password123
+        auth = self.headers.get("Authorization") or ""
+        if not auth.startswith("Bearer "):
             self._send_no_content(401)
             return
-
-        if user_password != password:
+        token = auth[7:].strip()
+        if token != "password123":
             self._send_no_content(401)
-            return
-
-        if username not in DNA_DB:
-            DNA_DB[username] = []
-        if dna_sample not in DNA_DB[username]:
-            DNA_DB[username].append(dna_sample)
-
-        self._send_no_content(204)
-
-    def handle_dna_login(self):
-        """
-        POST /dna-login
-        GalacticBuf body:
-          username (string)
-          dna_sample (string)
-
-        - 400: invalid input or invalid DNA
-        - 401: user missing / no DNA / no match
-        - 200: { token: string }
-        """
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        username = (data.get("username") or "").strip()
-        dna_sample = (data.get("dna_sample") or "").strip()
-
-        if not username or not dna_sample:
-            self._send_no_content(400)
-            return
-
-        if not is_valid_dna(dna_sample):
-            self._send_no_content(400)
             return
 
         if username not in USERS:
+            self._send_no_content(404)
+            return
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        if "collateral" not in data:
+            self._send_no_content(400)
+            return
+
+        try:
+            collateral_value = int(data.get("collateral"))
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        COLLATERAL[username] = collateral_value
+        self._send_no_content(204)
+
+    def handle_get_balance(self):
+        username = self._get_authenticated_user()
+        if not username:
             self._send_no_content(401)
             return
 
-        registered_samples = DNA_DB.get(username)
-        if not registered_samples:
-            self._send_no_content(401)
+        if username not in USERS:
+            self._send_no_content(404)
             return
 
-        matched = False
+        balance = BALANCES.get(username, 0)
+        potential = self._compute_potential_balance(username)
+        collateral = COLLATERAL.get(username)
+        if collateral is None:
+            # unlimited collateral – represent as a very large int
+            collateral = 9223372036854775807  # 2^63 - 1
 
-        for ref in registered_samples:
-            ref_codons = len(ref) // 3
-            allowed_diff = ref_codons // 100000
-
-            # If diff==0 and lengths differ, impossible to match
-            if allowed_diff == 0 and len(ref) != len(dna_sample):
-                continue
-
-            dist = codon_edit_distance(ref, dna_sample)
-            if dist <= allowed_diff:
-                matched = True
-                break
-
-        if not matched:
-            self._send_no_content(401)
-            return
-
-        token = uuid.uuid4().hex
-        TOKENS[token] = username
-        self._send_gbuf(200, {"token": token})
+        self._send_gbuf(200, {
+            "balance": int(balance),
+            "potential_balance": int(potential),
+            "collateral": int(collateral),
+        })
 
 
 def run():
