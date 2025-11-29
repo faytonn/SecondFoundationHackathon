@@ -15,9 +15,42 @@ TRADES = []
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
+# New: DNA samples
+# username -> list of registered DNA strings
+DNA_SAMPLES = {}
+
 
 class Handler(BaseHTTPRequestHandler):
     # ---------- helpers ----------
+
+    def _check_trading_window(self, delivery_start: int):
+        """
+        Returns:
+            True  - inside trading window
+            False - already responded with 425/451
+        """
+
+        now_ms = int(time.time() * 1000)
+
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000     # 15 days
+        CLOSE_MS = 60 * 1000                   # 1 min
+
+        open_time = delivery_start - OPEN_MS
+        close_time = delivery_start - CLOSE_MS
+
+        if now_ms < open_time:
+            self.send_response(425)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+
+        if now_ms > close_time:
+            self.send_response(451)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+
+        return True
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0"))
@@ -108,6 +141,93 @@ class Handler(BaseHTTPRequestHandler):
 
         return balance
 
+    # ---------- DNA helpers ----------
+
+    def _validate_dna_sample(self, dna: str) -> bool:
+        if not dna:
+            return False
+        if len(dna) % 3 != 0:
+            return False
+        for ch in dna:
+            if ch not in ("C", "G", "A", "T"):
+                return False
+        return True
+
+    def _split_codons(self, dna: str):
+        return [dna[i:i+3] for i in range(0, len(dna), 3)]
+
+    def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
+        """
+        Levenshtein distance on codons with a hard cap max_diff.
+        Returns a value > max_diff if distance exceeds max_diff.
+        Uses a banded DP of width ~2*max_diff+1.
+        """
+        n = len(ref_codons)
+        m = len(sample_codons)
+
+        if max_diff < 0:
+            return max_diff + 1
+
+        # At least this many insert/delete ops
+        if abs(n - m) > max_diff:
+            return max_diff + 1
+
+        if n == 0:
+            return m
+        if m == 0:
+            return n
+
+        # prev and curr are dicts: j -> cost
+        prev = {}
+        # row 0: cost = j (0..min(m, max_diff))
+        for j in range(0, min(m, max_diff) + 1):
+            prev[j] = j
+
+        for i in range(1, n + 1):
+            j_min = max(0, i - max_diff)
+            j_max = min(m, i + max_diff)
+            curr = {}
+
+            for j in range(j_min, j_max + 1):
+                # insertion: (i, j-1) -> (i, j)
+                if j > j_min:
+                    ins = curr[j - 1] + 1
+                else:
+                    ins = max_diff + 1  # out of band
+
+                # deletion: (i-1, j) -> (i, j)
+                dele = prev.get(j, max_diff + 1) + 1
+
+                # substitution / match: (i-1, j-1) -> (i, j)
+                if j - 1 in prev:
+                    sub_cost = 0 if ref_codons[i - 1] == sample_codons[j - 1] else 1
+                    sub = prev[j - 1] + sub_cost
+                else:
+                    sub = max_diff + 1
+
+                curr[j] = min(ins, dele, sub)
+
+            if min(curr.values()) > max_diff:
+                return max_diff + 1
+
+            prev = curr
+
+        dist = prev.get(m, max_diff + 1)
+        return dist
+
+    def _dna_matches(self, reference: str, submitted: str) -> bool:
+        ref_codons = self._split_codons(reference)
+        sub_codons = self._split_codons(submitted)
+
+        ref_count = len(ref_codons)
+        allowed_diff = ref_count // 100000  # floor(Ca/100000)
+
+        # If ref is very short, allowed_diff might be 0 -> exact or within 0 edits
+        max_diff = allowed_diff
+
+        dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
+        return dist <= allowed_diff
+
     # ---------- HTTP methods ----------
 
     def do_GET(self):
@@ -159,10 +279,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            # You can implement this later – for now just not implemented.
+            # Not implemented yet
             self.send_response(501)
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/dna-submit":
+            self.handle_dna_submit()
+        elif self.path == "/dna-login":
+            self.handle_dna_login()
         else:
             self.send_response(404)
             self.end_headers()
@@ -273,6 +397,89 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._send_no_content(204)
+
+    # ---------- DNA endpoints ----------
+
+    def handle_dna_submit(self):
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        username = (data.get("username") or "").strip()
+        password = (data.get("password") or "").strip()
+        dna_sample = (data.get("dna_sample") or "").strip()
+
+        # Validate input presence
+        if not username or not password or not dna_sample:
+            self._send_no_content(400)
+            return
+
+        # Check credentials (username/password)
+        if USERS.get(username) != password:
+            self._send_no_content(401)
+            return
+
+        # Validate DNA format
+        if not self._validate_dna_sample(dna_sample):
+            self._send_no_content(400)
+            return
+
+        # Register DNA; duplicate samples are fine (idempotent)
+        samples = DNA_SAMPLES.setdefault(username, [])
+        if dna_sample not in samples:
+            samples.append(dna_sample)
+
+        self._send_no_content(204)
+
+    def handle_dna_login(self):
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        username = (data.get("username") or "").strip()
+        dna_sample = (data.get("dna_sample") or "").strip()
+
+        # Validate input presence
+        if not username or not dna_sample:
+            self._send_no_content(400)
+            return
+
+        # User must exist and have DNA registered
+        if username not in USERS:
+            self._send_no_content(401)
+            return
+
+        if username not in DNA_SAMPLES or not DNA_SAMPLES[username]:
+            self._send_no_content(401)
+            return
+
+        # Validate DNA format
+        if not self._validate_dna_sample(dna_sample):
+            self._send_no_content(400)
+            return
+
+        # Compare against all reference samples
+        matched = False
+        for ref in DNA_SAMPLES[username]:
+            if self._dna_matches(ref, dna_sample):
+                matched = True
+                break
+
+        if not matched:
+            self._send_no_content(401)
+            return
+
+        # Success → issue token just like /login
+        token = uuid.uuid4().hex
+        TOKENS[token] = username
+
+        self._send_gbuf(200, {"token": token})
 
     # ---------- V1 orders & trades ----------
 
@@ -458,6 +665,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if delivery_end - delivery_start != HOUR_MS:
             self._send_no_content(400)
+            return
+
+        if not self._check_trading_window(delivery_start):
             return
 
         # Collateral check BEFORE matching/adding order
@@ -778,6 +988,17 @@ class Handler(BaseHTTPRequestHandler):
         if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
             self._send_no_content(400)
             return
+
+        # Trading window: outside window → empty orderbook
+        OPEN_MS = 15 * 24 * 60 * 60 * 1000
+        CLOSE_MS = 60 * 1000
+        now_ms = int(time.time() * 1000)
+
+        open_time = delivery_start - OPEN_MS
+        close_time = delivery_start - CLOSE_MS
+
+        if not (open_time <= now_ms <= close_time):
+            return self._send_gbuf(200, {"bids": [], "asks": []})
 
         bids = []
         asks = []
