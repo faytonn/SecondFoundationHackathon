@@ -139,6 +139,10 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/balance":
             self.handle_get_balance()
 
+        elif parsed.path == "/v2/trades":
+            # NEW: public V2 trades endpoint
+            self.handle_v2_trades(parsed)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -533,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
+                "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -703,6 +708,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
+                "source": "v2",  # mark as V2 trade
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -891,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged, still global feed) ----------
+    # ---------- public trades (unchanged: global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -904,6 +910,54 @@ class Handler(BaseHTTPRequestHandler):
                 "seller_id": str(t["seller_id"]),
                 "price": int(t["price"]),
                 "quantity": int(t["quantity"]),
+                "timestamp": int(t["timestamp"]),
+            })
+
+        self._send_gbuf(200, {"trades": trades_payload})
+
+    # ---------- NEW: public V2-only trades for a contract ----------
+
+    def handle_v2_trades(self, parsed):
+        qs = parse_qs(parsed.query)
+        if "delivery_start" not in qs or "delivery_end" not in qs:
+            self._send_no_content(400)
+            return
+
+        try:
+            delivery_start = int(qs["delivery_start"][0])
+            delivery_end = int(qs["delivery_end"][0])
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            self._send_no_content(400)
+            return
+        if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        # Filter only V2 trades for the given contract
+        v2_trades = [
+            t for t in TRADES
+            if t.get("source") == "v2"
+            and t.get("delivery_start") == delivery_start
+            and t.get("delivery_end") == delivery_end
+        ]
+
+        v2_trades.sort(key=lambda t: int(t["timestamp"]), reverse=True)
+
+        trades_payload = []
+        for t in v2_trades:
+            trades_payload.append({
+                "trade_id": str(t["trade_id"]),
+                "buyer_id": str(t["buyer_id"]),
+                "seller_id": str(t["seller_id"]),
+                "price": int(t["price"]),
+                "quantity": int(t["quantity"]),
+                "delivery_start": int(t["delivery_start"]),
+                "delivery_end": int(t["delivery_end"]),
                 "timestamp": int(t["timestamp"]),
             })
 
@@ -953,6 +1007,7 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
+            "source": "v1",  # mark as V1 trade
         }
         TRADES.append(trade)
 
