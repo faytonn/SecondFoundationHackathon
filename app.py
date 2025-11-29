@@ -11,15 +11,17 @@ import json
 USERS = {}
 TOKENS = {}
 
-ORDERS = []       # V1 orders (non-persistent)
-V2_ORDERS = []    # V2 orders (persistent)
-TRADES = []       # Trades (persistent)
+ORDERS = []      # V1 orders (in-memory only, does NOT persist)
+V2_ORDERS = []   # V2 orders (persisted)
+TRADES = []      # All trades in-memory; only V2 trades are persisted
 
-# New: balances + collateral
+# balances are derived from V2 trades (recomputed on startup from persisted trades)
 BALANCES = {}     # username -> int
+
+# collateral limits (persisted)
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
-# New: DNA samples
+# DNA samples (persisted)
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
 
@@ -29,54 +31,84 @@ TRADE_STREAM_CLIENTS = []
 # ---------- persistence setup ----------
 
 PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
-STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_DIR else None
+STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json") if PERSISTENT_DIR else None
+
+
+def _rebuild_balances_from_trades():
+    """
+    Recompute BALANCES only from V2 trades.
+    V1 trades are not persisted, so they don't affect balances after restart.
+    """
+    global BALANCES
+    BALANCES = {}
+    for t in TRADES:
+        if t.get("source") != "v2":
+            continue
+        try:
+            price = int(t["price"])
+            qty = int(t["quantity"])
+        except Exception:
+            continue
+        amount = price * qty
+        buyer = t["buyer_id"]
+        seller = t["seller_id"]
+        BALANCES[buyer] = BALANCES.get(buyer, 0) - amount
+        BALANCES[seller] = BALANCES.get(seller, 0) + amount
 
 
 def load_state():
-    global USERS, V2_ORDERS, TRADES, BALANCES, COLLATERAL, DNA_SAMPLES
+    global USERS, DNA_SAMPLES, COLLATERAL, V2_ORDERS, TRADES
+
     if not STATE_FILE:
         return
+
     try:
+        if not os.path.exists(STATE_FILE):
+            return
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except FileNotFoundError:
-        return
     except Exception:
-        # Corrupted / unreadable file → start fresh in memory
+        # If anything goes wrong, start with empty state
         return
 
-    USERS = data.get("users", {})
-    V2_ORDERS = data.get("v2_orders", [])
-    TRADES = data.get("trades", [])
-    BALANCES = data.get("balances", {})
-    COLLATERAL = data.get("collateral", {})
-    DNA_SAMPLES = data.get("dna_samples", {})
+    USERS = data.get("users", {}) or {}
+    DNA_SAMPLES = data.get("dna_samples", {}) or {}
+    COLLATERAL = data.get("collateral", {}) or {}
+    V2_ORDERS[:] = data.get("v2_orders", []) or []
+
+    # Persisted trades: only V2 trades were stored
+    TRADES[:] = data.get("trades", []) or []
+
+    # Rebuild balances from persisted V2 trades
+    _rebuild_balances_from_trades()
 
 
 def save_state():
     if not STATE_FILE:
         return
-    data = {
+
+    # Only persist essential state
+    state = {
         "users": USERS,
-        "v2_orders": V2_ORDERS,
-        "trades": TRADES,
-        "balances": BALANCES,
-        "collateral": COLLATERAL,
         "dna_samples": DNA_SAMPLES,
-        # NOTE: TOKENS and V1 ORDERS are intentionally not persisted
+        "collateral": COLLATERAL,
+        "v2_orders": V2_ORDERS,
+        # Only V2 trades need to persist; V1 state can reset
+        "trades": [t for t in TRADES if t.get("source") == "v2"],
     }
-    tmp = STATE_FILE + ".tmp"
+
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, STATE_FILE)
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp_path, STATE_FILE)
     except Exception:
-        # If saving fails, ignore; old state (if any) remains
+        # On failure, just ignore; app must still run
         pass
 
 
-# Load state on startup
+# Load persisted state at startup
 load_state()
 
 
@@ -555,8 +587,8 @@ class Handler(BaseHTTPRequestHandler):
         samples = DNA_SAMPLES.setdefault(username, [])
         if dna_sample not in samples:
             samples.append(dna_sample)
+            save_state()
 
-        save_state()
         self._send_no_content(204)
 
     def handle_dna_login(self):
@@ -606,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"token": token})
 
-    # ---------- V1 orders & trades ----------
+    # ---------- V1 orders & trades (NOT persisted) ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -689,7 +721,6 @@ class Handler(BaseHTTPRequestHandler):
         }
         ORDERS.append(order)
 
-        # V1 orders are not persisted
         self._send_gbuf(200, {"order_id": order_id})
 
     # ---------- collateral checks ----------
@@ -937,7 +968,9 @@ class Handler(BaseHTTPRequestHandler):
             # so remaining should be 0 here.
             status = "FILLED"
 
+        # Persist V2 state + V2 trades
         save_state()
+
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -1099,6 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
             order["status"] = "FILLED"
 
         save_state()
+
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -1283,7 +1317,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades (global, V1+V2 in-memory) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1349,7 +1383,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- V1 take order (creates trades, updates balance) ----------
+    # ---------- V1 take order (creates trades, updates balance, NOT persisted) ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -1399,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
-        save_state()
+        # V1 trades are not persisted across restarts
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1496,8 +1530,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run():
-    server = HTTPServer(("", 8080), Handler)
-    print("Server running on port 8080...")
+    port = int(os.environ.get("PORT", "8080"))
+    server = HTTPServer(("", port), Handler)
+    print(f"Server running on port {port}...")
     server.serve_forever()
 
 
