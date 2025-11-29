@@ -5,8 +5,6 @@ import uuid
 import time
 import base64
 import hashlib
-import os
-import json
 
 USERS = {}
 TOKENS = {}
@@ -20,91 +18,11 @@ BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
 # New: DNA samples
-# username -> list of registered DNA strings
+# username -> list of registered DNA strings (normalized as str)
 DNA_SAMPLES = {}
 
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
-
-# ---------- persistence ----------
-
-PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
-STATE_FILE = os.path.join(PERSISTENT_DIR, "exchange_state.json") if PERSISTENT_DIR else None
-
-
-def _rebuild_balances_from_trades():
-    """
-    Recompute BALANCES only from V2 trades.
-    V1 state does not persist across restarts.
-    """
-    global BALANCES
-    BALANCES = {}
-    for t in TRADES:
-        if t.get("source") != "v2":
-            continue
-        try:
-            price = int(t["price"])
-            qty = int(t["quantity"])
-        except Exception:
-            continue
-        amount = price * qty
-        buyer = t["buyer_id"]
-        seller = t["seller_id"]
-        BALANCES[buyer] = BALANCES.get(buyer, 0) - amount
-        BALANCES[seller] = BALANCES.get(seller, 0) + amount
-
-
-def load_state():
-    global USERS, V2_ORDERS, TRADES, DNA_SAMPLES, COLLATERAL
-
-    if not STATE_FILE:
-        return
-
-    try:
-        if not os.path.exists(STATE_FILE):
-            return
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        # Any failure → start with empty state
-        return
-
-    USERS = data.get("users", {}) or {}
-    DNA_SAMPLES = data.get("dna_samples", {}) or {}
-    COLLATERAL = data.get("collateral", {}) or {}
-
-    V2_ORDERS[:] = data.get("v2_orders", []) or []
-    TRADES[:] = data.get("trades", []) or []
-
-    _rebuild_balances_from_trades()
-
-
-def save_state():
-    if not STATE_FILE:
-        return
-
-    state = {
-        "users": USERS,
-        "dna_samples": DNA_SAMPLES,
-        "collateral": COLLATERAL,
-        "v2_orders": V2_ORDERS,
-        # Persist only V2 trades; V1 state can reset
-        "trades": [t for t in TRADES if t.get("source") == "v2"],
-    }
-
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        tmp_path = STATE_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp_path, STATE_FILE)
-    except Exception:
-        # Ignore persistence errors – service must still run
-        pass
-
-
-# Load persisted state on startup
-load_state()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -230,18 +148,37 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- DNA helpers ----------
 
-    def _validate_dna_sample(self, dna: str) -> bool:
+    def _validate_dna_sample(self, dna) -> bool:
+        """
+        Accepts str or bytes.
+        Only C/G/A/T, length must be multiple of 3.
+        """
         if not dna:
             return False
-        if len(dna) % 3 != 0:
-            return False
-        for ch in dna:
-            if ch not in ("C", "G", "A", "T"):
-                return False
-        return True
 
-    def _split_codons(self, dna: str):
-        return [dna[i:i+3] for i in range(0, len(dna), 3)]
+        if isinstance(dna, bytes):
+            n = len(dna)
+            if n % 3 != 0:
+                return False
+            allowed = {ord("C"), ord("G"), ord("A"), ord("T")}
+            for b in dna:
+                if b not in allowed:
+                    return False
+            return True
+
+        if isinstance(dna, str):
+            if len(dna) % 3 != 0:
+                return False
+            for ch in dna:
+                if ch not in ("C", "G", "A", "T"):
+                    return False
+            return True
+
+        return False
+
+    def _split_codons(self, dna_str: str):
+        # dna_str is guaranteed to be a str, len multiple of 3
+        return [dna_str[i:i+3] for i in range(0, len(dna_str), 3)]
 
     def _codon_edit_distance_bounded(self, ref_codons, sample_codons, max_diff: int) -> int:
         """
@@ -264,9 +201,7 @@ class Handler(BaseHTTPRequestHandler):
         if m == 0:
             return n
 
-        # prev and curr are dicts: j -> cost
         prev = {}
-        # row 0: cost = j (0..min(m, max_diff))
         for j in range(0, min(m, max_diff) + 1):
             prev[j] = j
 
@@ -276,16 +211,13 @@ class Handler(BaseHTTPRequestHandler):
             curr = {}
 
             for j in range(j_min, j_max + 1):
-                # insertion: (i, j-1) -> (i, j)
                 if j > j_min:
                     ins = curr[j - 1] + 1
                 else:
-                    ins = max_diff + 1  # out of band
+                    ins = max_diff + 1
 
-                # deletion: (i-1, j) -> (i, j)
                 dele = prev.get(j, max_diff + 1) + 1
 
-                # substitution / match: (i-1, j-1) -> (i, j)
                 if j - 1 in prev:
                     sub_cost = 0 if ref_codons[i - 1] == sample_codons[j - 1] else 1
                     sub = prev[j - 1] + sub_cost
@@ -302,16 +234,45 @@ class Handler(BaseHTTPRequestHandler):
         dist = prev.get(m, max_diff + 1)
         return dist
 
-    def _dna_matches(self, reference: str, submitted: str) -> bool:
+    def _dna_matches(self, reference, submitted) -> bool:
+        """
+        reference: stored as str (from DNA_SAMPLES)
+        submitted: str or bytes (from login)
+        """
+        # Normalize to str
+        if isinstance(reference, bytes):
+            try:
+                reference = reference.decode("ascii")
+            except Exception:
+                return False
+
+        if isinstance(submitted, bytes):
+            try:
+                submitted = submitted.decode("ascii")
+            except Exception:
+                return False
+
+        if not isinstance(reference, str) or not isinstance(submitted, str):
+            return False
+
+        # Basic structural checks
+        if not reference or not submitted:
+            return False
+        if len(reference) % 3 != 0 or len(submitted) % 3 != 0:
+            return False
+
+        ref_codons_count = len(reference) // 3
+        allowed_diff = ref_codons_count // 100000  # floor(Ca/100000)
+
+        # Fast path: allowed_diff == 0 -> exact match only
+        if allowed_diff == 0:
+            return reference == submitted
+
+        # For non-zero allowed_diff, use banded DP on codons
         ref_codons = self._split_codons(reference)
         sub_codons = self._split_codons(submitted)
 
-        ref_count = len(ref_codons)
-        allowed_diff = ref_count // 100000  # floor(Ca/100000)
-
-        # If ref is very short, allowed_diff might be 0 -> exact or within 0 edits
         max_diff = allowed_diff
-
         dist = self._codon_edit_distance_bounded(ref_codons, sub_codons, max_diff)
         return dist <= allowed_diff
 
@@ -355,6 +316,544 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     pass
 
+    # ---------- bulk ops simulation helpers (unchanged from your version) ----------
+
+    def _bulk_sim_create(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
+        """Simulate create operation, return validation result with trades if any"""
+        try:
+            side = (op.get("side") or "").strip()
+            price = int(op.get("price"))
+            quantity = int(op.get("quantity"))
+            execution_type = (op.get("execution_type") or "GTC").strip() or "GTC"
+        except:
+            return {"ok": False, "status": 400}
+
+        if side not in ("buy", "sell"):
+            return {"ok": False, "status": 400}
+        if quantity <= 0:
+            return {"ok": False, "status": 400}
+        if execution_type not in ("GTC", "IOC", "FOK"):
+            return {"ok": False, "status": 400}
+
+        # Check collateral in simulated state
+        if not self._check_collateral_in_sim_state(username, side, price, quantity, staged_ops):
+            return {"ok": False, "status": 402}
+
+        order_id = uuid.uuid4().hex
+        now_ms = int(time.time() * 1000)
+
+        # Build hypothetical order book including staged creates/modifies
+        sim_book = self._build_sim_order_book(ds, de, staged_ops)
+
+        # Find matching orders
+        if side == "buy":
+            candidates = [
+                o for o in sim_book
+                if o["side"] == "sell"
+                and o["price"] <= price
+            ]
+            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
+        else:
+            candidates = [
+                o for o in sim_book
+                if o["side"] == "buy"
+                and o["price"] >= price
+            ]
+            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
+
+        # Self-match check
+        for c in candidates:
+            if c.get("owner") == username:
+                return {"ok": False, "status": 412}
+
+        # Simulate matching
+        remaining = quantity
+        filled_quantity = 0
+        trades = []
+
+        for resting in candidates:
+            if remaining <= 0:
+                break
+            if resting["quantity"] <= 0:
+                continue
+
+            trade_qty = min(remaining, resting["quantity"])
+            if trade_qty <= 0:
+                continue
+
+            if side == "buy":
+                buyer_id = username
+                seller_id = resting["owner"]
+            else:
+                buyer_id = resting["owner"]
+                seller_id = username
+
+            trade = {
+                "trade_id": uuid.uuid4().hex,
+                "buyer_id": buyer_id,
+                "seller_id": seller_id,
+                "price": resting["price"],
+                "quantity": trade_qty,
+                "timestamp": int(time.time() * 1000),
+                "delivery_start": ds,
+                "delivery_end": de,
+                "source": "v2",
+            }
+            trades.append(trade)
+
+            remaining -= trade_qty
+            filled_quantity += trade_qty
+            resting["quantity"] -= trade_qty
+
+        # FOK check
+        if execution_type == "FOK" and remaining > 0:
+            return {
+                "ok": True,
+                "action": "create",
+                "order_id": order_id,
+                "status": "CANCELLED",
+                "order": None,
+                "trades": [],
+            }
+
+        # Determine final status
+        if execution_type == "GTC":
+            if remaining > 0:
+                status = "ACTIVE"
+                order_data = {
+                    "order_id": order_id,
+                    "side": side,
+                    "owner": username,
+                    "price": price,
+                    "quantity": remaining,
+                    "delivery_start": ds,
+                    "delivery_end": de,
+                    "status": "ACTIVE",
+                    "created_at": now_ms,
+                }
+            else:
+                status = "FILLED"
+                order_data = None
+        elif execution_type == "IOC":
+            status = "FILLED" if remaining <= 0 else "CANCELLED"
+            order_data = None
+        else:  # FOK
+            status = "FILLED"
+            order_data = None
+
+        return {
+            "ok": True,
+            "action": "create",
+            "order_id": order_id,
+            "status": status,
+            "order": order_data,
+            "trades": trades,
+        }
+
+    def _bulk_sim_modify(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
+        """Simulate modify operation, return validation result"""
+        try:
+            order_id = op.get("order_id", "").strip()
+            new_price = int(op.get("price"))
+            new_quantity = int(op.get("quantity"))
+        except:
+            return {"ok": False, "status": 400}
+
+        if not order_id:
+            return {"ok": False, "status": 400}
+        if new_quantity <= 0:
+            return {"ok": False, "status": 400}
+
+        # Find order in real book or staged creates
+        order = self._find_order_in_sim(order_id, ds, de, staged_ops)
+
+        if not order:
+            return {"ok": False, "status": 404}
+
+        if order.get("owner") != username:
+            return {"ok": False, "status": 403}
+
+        # Check if already cancelled in staged ops
+        for sop in staged_ops:
+            if sop.get("action") == "cancel" and sop.get("order_id") == order_id:
+                return {"ok": False, "status": 404}
+
+        side = order["side"]
+
+        # Build sim book
+        sim_book = self._build_sim_order_book(ds, de, staged_ops, exclude_order_id=order_id)
+
+        # Find matching orders with new price
+        if side == "buy":
+            candidates = [
+                o for o in sim_book
+                if o["side"] == "sell"
+                and o["price"] <= new_price
+            ]
+            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
+        else:
+            candidates = [
+                o for o in sim_book
+                if o["side"] == "buy"
+                and o["price"] >= new_price
+            ]
+            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
+
+        # Self-match check
+        for c in candidates:
+            if c.get("owner") == username:
+                return {"ok": False, "status": 412}
+
+        # Collateral check with new values
+        if not self._check_collateral_modify_in_sim(username, order_id, new_price, new_quantity, staged_ops):
+            return {"ok": False, "status": 402}
+
+        # Simulate matching
+        remaining = new_quantity
+        filled_quantity = 0
+        trades = []
+        now_ms = int(time.time() * 1000)
+
+        old_price = order["price"]
+        old_quantity = order["quantity"]
+
+        for resting in candidates:
+            if remaining <= 0:
+                break
+            if resting["quantity"] <= 0:
+                continue
+
+            trade_qty = min(remaining, resting["quantity"])
+            if trade_qty <= 0:
+                continue
+
+            if side == "buy":
+                buyer_id = username
+                seller_id = resting["owner"]
+            else:
+                buyer_id = resting["owner"]
+                seller_id = username
+
+            trade = {
+                "trade_id": uuid.uuid4().hex,
+                "buyer_id": buyer_id,
+                "seller_id": seller_id,
+                "price": resting["price"],
+                "quantity": trade_qty,
+                "timestamp": int(time.time() * 1000),
+                "delivery_start": ds,
+                "delivery_end": de,
+                "source": "v2",
+            }
+            trades.append(trade)
+
+            remaining -= trade_qty
+            filled_quantity += trade_qty
+            resting["quantity"] -= trade_qty
+
+        status = "FILLED" if remaining <= 0 else "ACTIVE"
+
+        result = {
+            "ok": True,
+            "action": "modify",
+            "order_id": order_id,
+            "new_price": new_price,
+            "new_quantity": remaining,
+            "status": status,
+            "trades": trades,
+        }
+
+        if new_price != old_price or new_quantity > old_quantity:
+            result["created_at"] = now_ms
+
+        return result
+
+    def _bulk_sim_cancel(self, username: str, op: dict, ds: int, de: int, staged_ops: list):
+        """Simulate cancel operation, return validation result"""
+        try:
+            order_id = op.get("order_id", "").strip()
+        except:
+            return {"ok": False, "status": 400}
+
+        if not order_id:
+            return {"ok": False, "status": 400}
+
+        # Find order
+        order = self._find_order_in_sim(order_id, ds, de, staged_ops)
+
+        if not order:
+            return {"ok": False, "status": 404}
+
+        if order.get("owner") != username:
+            return {"ok": False, "status": 403}
+
+        # Check if already cancelled in staged ops
+        for sop in staged_ops:
+            if sop.get("action") == "cancel" and sop.get("order_id") == order_id:
+                return {"ok": False, "status": 404}
+
+        return {
+            "ok": True,
+            "action": "cancel",
+            "order_id": order_id,
+        }
+
+    def _build_sim_order_book(self, ds: int, de: int, staged_ops: list, exclude_order_id: str = None):
+        """Build hypothetical order book including real orders + staged creates/modifies"""
+        sim_book = []
+
+        # Start with real active orders
+        for o in V2_ORDERS:
+            if o.get("status") != "ACTIVE":
+                continue
+            if o["quantity"] <= 0:
+                continue
+            if o["delivery_start"] != ds or o["delivery_end"] != de:
+                continue
+            if exclude_order_id and o["order_id"] == exclude_order_id:
+                continue
+
+            # Check if this order was modified or cancelled in staged ops
+            was_modified = False
+            was_cancelled = False
+            modified_data = None
+
+            for sop in staged_ops:
+                if sop.get("order_id") == o["order_id"]:
+                    if sop["action"] == "cancel":
+                        was_cancelled = True
+                        break
+                    elif sop["action"] == "modify":
+                        was_modified = True
+                        modified_data = sop
+                        break
+
+            if was_cancelled:
+                continue
+
+            if was_modified:
+                sim_book.append({
+                    "order_id": o["order_id"],
+                    "side": o["side"],
+                    "owner": o["owner"],
+                    "price": modified_data["new_price"],
+                    "quantity": modified_data["new_quantity"],
+                    "created_at": modified_data.get("created_at", o.get("created_at", 0)),
+                })
+            else:
+                sim_book.append({
+                    "order_id": o["order_id"],
+                    "side": o["side"],
+                    "owner": o["owner"],
+                    "price": o["price"],
+                    "quantity": o["quantity"],
+                    "created_at": o.get("created_at", 0),
+                })
+
+        # Add staged creates that are ACTIVE
+        for sop in staged_ops:
+            if sop["action"] == "create" and sop.get("order"):
+                order_data = sop["order"]
+                sim_book.append({
+                    "order_id": order_data["order_id"],
+                    "side": order_data["side"],
+                    "owner": order_data["owner"],
+                    "price": order_data["price"],
+                    "quantity": order_data["quantity"],
+                    "created_at": order_data.get("created_at", 0),
+                })
+
+        return sim_book
+
+    def _find_order_in_sim(self, order_id: str, ds: int, de: int, staged_ops: list):
+        """Find order in real book or staged creates"""
+        # Check staged creates first
+        for sop in staged_ops:
+            if sop["action"] == "create" and sop.get("order"):
+                if sop["order"]["order_id"] == order_id:
+                    return sop["order"]
+
+        # Check real orders
+        for o in V2_ORDERS:
+            if o["order_id"] == order_id:
+                if o.get("status") != "ACTIVE" or o["quantity"] <= 0:
+                    return None
+                if o["delivery_start"] != ds or o["delivery_end"] != de:
+                    return None
+                return o
+
+        return None
+
+    def _check_collateral_in_sim_state(self, username: str, side: str, price: int, quantity: int, staged_ops: list):
+        """Check collateral considering staged operations"""
+        coll = COLLATERAL.get(username)
+        if coll is None:
+            return True
+
+        if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
+            return True
+
+        # Compute balance including staged trades
+        balance = BALANCES.get(username, 0)
+
+        for sop in staged_ops:
+            for trade in sop.get("trades", []):
+                buyer = trade["buyer_id"]
+                seller = trade["seller_id"]
+                amount = trade["price"] * trade["quantity"]
+                if buyer == username:
+                    balance -= amount
+                elif seller == username:
+                    balance += amount
+
+        # Include existing active orders
+        for o in V2_ORDERS:
+            if o.get("owner") != username:
+                continue
+            if o.get("status") != "ACTIVE":
+                continue
+            qty = int(o.get("quantity", 0))
+            if qty <= 0:
+                continue
+
+            # Check if this order was modified/cancelled in staged ops
+            skip = False
+            for sop in staged_ops:
+                if sop.get("order_id") == o["order_id"]:
+                    if sop["action"] in ("modify", "cancel"):
+                        skip = True
+                        break
+
+            if skip:
+                continue
+
+            p = int(o["price"])
+            s = o["side"]
+            if s == "buy":
+                balance -= p * qty
+            else:
+                balance += p * qty
+
+        # Include staged creates/modifies
+        for sop in staged_ops:
+            if sop["action"] == "create" and sop.get("order"):
+                od = sop["order"]
+                if od["owner"] == username:
+                    qty = od["quantity"]
+                    p = od["price"]
+                    s = od["side"]
+                    if s == "buy":
+                        balance -= p * qty
+                    else:
+                        balance += p * qty
+            elif sop["action"] == "modify":
+                # Find original order
+                for o in V2_ORDERS:
+                    if o["order_id"] == sop["order_id"] and o["owner"] == username:
+                        qty = sop["new_quantity"]
+                        p = sop["new_price"]
+                        s = o["side"]
+                        if s == "buy":
+                            balance -= p * qty
+                        else:
+                            balance += p * qty
+                        break
+
+        # Now add this new order's effect
+        if side == "buy":
+            balance -= price * quantity
+        else:
+            balance += price * quantity
+
+        return balance >= -coll
+
+    def _check_collateral_modify_in_sim(self, username: str, order_id: str, new_price: int, new_quantity: int, staged_ops: list):
+        """Check collateral for modify in sim state"""
+        coll = COLLATERAL.get(username)
+        if coll is None:
+            return True
+
+        # Find the order being modified
+        target_order = None
+        for o in V2_ORDERS:
+            if o["order_id"] == order_id and o["owner"] == username:
+                target_order = o
+                break
+
+        if not target_order:
+            # Maybe it's a staged create
+            for sop in staged_ops:
+                if sop["action"] == "create" and sop.get("order"):
+                    if sop["order"]["order_id"] == order_id:
+                        target_order = sop["order"]
+                        break
+
+        if not target_order:
+            return True
+
+        side = target_order["side"]
+        if not ((side == "buy" and new_price > 0) or (side == "sell" and new_price < 0)):
+            return True
+
+        # Compute balance with all staged effects except this modify
+        balance = BALANCES.get(username, 0)
+
+        for sop in staged_ops:
+            for trade in sop.get("trades", []):
+                buyer = trade["buyer_id"]
+                seller = trade["seller_id"]
+                amount = trade["price"] * trade["quantity"]
+                if buyer == username:
+                    balance -= amount
+                elif seller == username:
+                    balance += amount
+
+        # Include existing orders
+        for o in V2_ORDERS:
+            if o.get("owner") != username:
+                continue
+            if o.get("status") != "ACTIVE":
+                continue
+            qty = int(o.get("quantity", 0))
+            if qty <= 0:
+                continue
+
+            if o["order_id"] == order_id:
+                qty = new_quantity
+                p = new_price
+            else:
+                # Check if modified/cancelled
+                skip = False
+                for sop in staged_ops:
+                    if sop.get("order_id") == o["order_id"]:
+                        if sop["action"] in ("modify", "cancel"):
+                            skip = True
+                            break
+                if skip:
+                    continue
+                p = int(o["price"])
+
+            s = o["side"]
+            if s == "buy":
+                balance -= p * qty
+            else:
+                balance += p * qty
+
+        # Include staged creates (excluding this one)
+        for sop in staged_ops:
+            if sop["action"] == "create" and sop.get("order"):
+                od = sop["order"]
+                if od["owner"] == username and od["order_id"] != order_id:
+                    qty = od["quantity"]
+                    p = od["price"]
+                    s = od["side"]
+                    if s == "buy":
+                        balance -= p * qty
+                    else:
+                        balance += p * qty
+
+        return balance >= -coll
+
     # ---------- HTTP methods ----------
 
     def do_GET(self):
@@ -387,7 +886,6 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # NEW: public V2 trades endpoint
             self.handle_v2_trades(parsed)
 
         elif parsed.path == "/v2/stream/trades":
@@ -449,7 +947,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         if getattr(self, "_is_websocket", False):
-            # Do not close socket for WebSocket connections
             return
         try:
             self.wfile.close()
@@ -482,7 +979,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
-        save_state()
         self._send_no_content(204)
 
     def handle_login(self):
@@ -539,12 +1035,121 @@ class Handler(BaseHTTPRequestHandler):
             tokens_to_delete = [t for t, u in list(TOKENS.items()) if u == username]
             for t in tokens_to_delete:
                 del TOKENS[t]
-            save_state()
         except Exception:
             self._send_no_content(500)
             return
 
         self._send_no_content(204)
+
+    # ---------- bulk operations endpoint ----------
+
+    def handle_bulk_operations(self):
+        try:
+            body = self._read_body()
+            data = decode_message(body)
+        except Exception:
+            return self._send_no_content(400)
+
+        contracts = data.get("contracts")
+        if not isinstance(contracts, list) or not contracts:
+            return self._send_no_content(400)
+
+        staged_operations = []
+
+        for contract in contracts:
+            try:
+                ds = int(contract["delivery_start"])
+                de = int(contract["delivery_end"])
+            except:
+                return self._send_no_content(400)
+
+            ops = contract.get("operations")
+            if not isinstance(ops, list) or not ops:
+                return self._send_no_content(400)
+
+            HOUR_MS = 3600000
+            if (ds % HOUR_MS) != 0 or (de % HOUR_MS) != 0:
+                return self._send_no_content(400)
+            if de <= ds or de - ds != HOUR_MS:
+                return self._send_no_content(400)
+
+            if not self._check_trading_window(ds):
+                return
+
+            for op in ops:
+                optype = op.get("type")
+                token = op.get("participant_token", "")
+                username = TOKENS.get(token)
+                if not username:
+                    return self._send_no_content(401)
+
+                if optype == "create":
+                    result = self._bulk_sim_create(username, op, ds, de, staged_operations)
+                elif optype == "modify":
+                    result = self._bulk_sim_modify(username, op, ds, de, staged_operations)
+                elif optype == "cancel":
+                    result = self._bulk_sim_cancel(username, op, ds, de, staged_operations)
+                else:
+                    return self._send_no_content(400)
+
+                if not result["ok"]:
+                    return self._send_no_content(result["status"])
+
+                staged_operations.append(result)
+
+        # ---------- commit ----------
+        for result in staged_operations:
+            if result["action"] == "create":
+                order_data = result["order"]
+                if order_data:
+                    V2_ORDERS.append(order_data)
+
+                for trade in result.get("trades", []):
+                    TRADES.append(trade)
+                    self._apply_trade_balances(
+                        trade["buyer_id"],
+                        trade["seller_id"],
+                        trade["price"],
+                        trade["quantity"],
+                    )
+                    self._broadcast_trade(trade)
+
+            elif result["action"] == "modify":
+                order_id = result["order_id"]
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["price"] = result["new_price"]
+                target["quantity"] = result["new_quantity"]
+                target["status"] = result["status"]
+                if "created_at" in result:
+                    target["created_at"] = result["created_at"]
+
+                for trade in result.get("trades", []):
+                    TRADES.append(trade)
+                    self._apply_trade_balances(
+                        trade["buyer_id"],
+                        trade["seller_id"],
+                        trade["price"],
+                        trade["quantity"],
+                    )
+                    self._broadcast_trade(trade)
+
+            elif result["action"] == "cancel":
+                order_id = result["order_id"]
+                target = next(o for o in V2_ORDERS if o["order_id"] == order_id)
+                target["status"] = "CANCELLED"
+                target["quantity"] = 0
+
+        results = []
+        for result in staged_operations:
+            entry = {
+                "type": result["action"],
+                "order_id": result["order_id"],
+            }
+            if "status" in result:
+                entry["status"] = result["status"]
+            results.append(entry)
+
+        return self._send_gbuf(200, {"results": results})
 
     # ---------- DNA endpoints ----------
 
@@ -558,28 +1163,42 @@ class Handler(BaseHTTPRequestHandler):
 
         username = (data.get("username") or "").strip()
         password = (data.get("password") or "").strip()
-        dna_sample = (data.get("dna_sample") or "").strip()
+        dna_raw = data.get("dna_sample", None)
 
-        # Validate input presence
-        if not username or not password or not dna_sample:
+        if not username or not password or dna_raw is None:
             self._send_no_content(400)
             return
 
-        # Check credentials (username/password)
         if USERS.get(username) != password:
             self._send_no_content(401)
             return
 
-        # Validate DNA format
+        # dna_raw may be bytes (v2) or str (v1)
+        if isinstance(dna_raw, bytes):
+            dna_sample = dna_raw  # keep bytes for validation
+        elif isinstance(dna_raw, str):
+            dna_sample = dna_raw.strip()
+        else:
+            self._send_no_content(400)
+            return
+
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Register DNA; duplicate samples are fine (idempotent)
+        # Normalize to str for storage
+        if isinstance(dna_sample, bytes):
+            try:
+                dna_store = dna_sample.decode("ascii")
+            except Exception:
+                self._send_no_content(400)
+                return
+        else:
+            dna_store = dna_sample
+
         samples = DNA_SAMPLES.setdefault(username, [])
-        if dna_sample not in samples:
-            samples.append(dna_sample)
-            save_state()
+        if dna_store not in samples:
+            samples.append(dna_store)
 
         self._send_no_content(204)
 
@@ -592,14 +1211,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         username = (data.get("username") or "").strip()
-        dna_sample = (data.get("dna_sample") or "").strip()
+        dna_raw = data.get("dna_sample", None)
 
-        # Validate input presence
-        if not username or not dna_sample:
+        if not username or dna_raw is None:
             self._send_no_content(400)
             return
 
-        # User must exist and have DNA registered
         if username not in USERS:
             self._send_no_content(401)
             return
@@ -608,12 +1225,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Validate DNA format
+        if isinstance(dna_raw, bytes):
+            dna_sample = dna_raw
+        elif isinstance(dna_raw, str):
+            dna_sample = dna_raw.strip()
+        else:
+            self._send_no_content(400)
+            return
+
         if not self._validate_dna_sample(dna_sample):
             self._send_no_content(400)
             return
 
-        # Compare against all reference samples
         matched = False
         for ref in DNA_SAMPLES[username]:
             if self._dna_matches(ref, dna_sample):
@@ -624,13 +1247,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(401)
             return
 
-        # Success → issue token just like /login
         token = uuid.uuid4().hex
         TOKENS[token] = username
 
         self._send_gbuf(200, {"token": token})
 
-    # ---------- V1 orders & trades (non-persistent) ----------
+    # ---------- V1 orders & trades ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -720,8 +1342,7 @@ class Handler(BaseHTTPRequestHandler):
     def _check_collateral_create(self, username: str, side: str, price: int, quantity: int) -> bool:
         coll = COLLATERAL.get(username)
         if coll is None:
-            return True  # unlimited
-        # Only check orders that can reduce balance
+            return True
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
         base = self._compute_potential_balance(username)
@@ -737,7 +1358,6 @@ class Handler(BaseHTTPRequestHandler):
         if coll is None:
             return True
 
-        # Recompute potential balance assuming the target order has (new_price, new_quantity)
         base = BALANCES.get(username, 0)
         side_for_target = None
 
@@ -764,7 +1384,6 @@ class Handler(BaseHTTPRequestHandler):
                 base += price * qty
 
         if side_for_target is None:
-            # Order not found as active – let other logic handle 404
             return True
 
         if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
@@ -824,7 +1443,6 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_trading_window(delivery_start):
             return
 
-        # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -837,7 +1455,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = quantity
         filled_quantity = 0
 
-        # Build candidate list on opposite side
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -848,9 +1465,8 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
-            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
+        else:
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -860,16 +1476,13 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
-            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match prevention BEFORE any trades / book changes
         for resting in candidates:
             if resting.get("owner") == username:
                 self._send_no_content(412)
                 return
 
-        # FOK: dry-run to see if full quantity can be filled immediately
         if execution_type == "FOK":
             total_possible = 0
             for resting in candidates:
@@ -880,7 +1493,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
             if total_possible < quantity:
-                # Cannot fully fill -> cancel, no trades, no book entry
                 self._send_gbuf(200, {
                     "order_id": order_id,
                     "status": "CANCELLED",
@@ -888,7 +1500,6 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-        # Matching loop (used by all types once we've passed FOK dry-run)
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -907,7 +1518,7 @@ class Handler(BaseHTTPRequestHandler):
                 buyer_id = resting["owner"]
                 seller_id = username
 
-            trade_price = resting["price"]  # maker price
+            trade_price = resting["price"]
             trade_id = uuid.uuid4().hex
             ts = int(time.time() * 1000)
 
@@ -920,11 +1531,11 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
+
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
-            # Broadcast to stream subscribers
             self._broadcast_trade(trade)
 
             remaining -= trade_qty
@@ -935,7 +1546,6 @@ class Handler(BaseHTTPRequestHandler):
                 resting["quantity"] = 0
                 resting["status"] = "FILLED"
 
-        # Decide final status and whether order goes into book
         if execution_type == "GTC":
             if remaining > 0:
                 status = "ACTIVE"
@@ -953,14 +1563,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 status = "FILLED"
         elif execution_type == "IOC":
-            # Never go into book; remaining is cancelled
             status = "FILLED" if remaining <= 0 else "CANCELLED"
-        else:  # FOK
-            # We already ensured via dry-run that we can fully fill
-            # so remaining should be 0 here.
+        else:
             status = "FILLED"
-
-        save_state()
 
         self._send_gbuf(200, {
             "order_id": order_id,
@@ -1016,7 +1621,6 @@ class Handler(BaseHTTPRequestHandler):
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
-        # Self-match prevention: compute candidates with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -1047,7 +1651,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(412)
                 return
 
-        # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             self.send_response(402)
             self.send_header("Content-Length", "0")
@@ -1057,7 +1660,6 @@ class Handler(BaseHTTPRequestHandler):
         old_price = order["price"]
         old_quantity = order["quantity"]
 
-        # Apply modifications
         order["price"] = new_price
         order["quantity"] = new_quantity
 
@@ -1068,7 +1670,6 @@ class Handler(BaseHTTPRequestHandler):
         remaining = order["quantity"]
         filled_quantity = 0
 
-        # Matching loop using precomputed candidates
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -1104,7 +1705,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -1121,8 +1722,6 @@ class Handler(BaseHTTPRequestHandler):
         if remaining <= 0:
             order["quantity"] = 0
             order["status"] = "FILLED"
-
-        save_state()
 
         self._send_gbuf(200, {
             "order_id": order["order_id"],
@@ -1153,7 +1752,6 @@ class Handler(BaseHTTPRequestHandler):
         order["status"] = "CANCELLED"
         order["quantity"] = 0
 
-        save_state()
         self._send_no_content(204)
 
     # ---------- V2 order book / my-orders / my-trades ----------
@@ -1179,7 +1777,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Trading window: outside window → empty orderbook
         OPEN_MS = 15 * 24 * 60 * 60 * 1000
         CLOSE_MS = 60 * 1000
         now_ms = int(time.time() * 1000)
@@ -1212,9 +1809,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 asks.append((o, entry))
 
-        # Bids: highest price first, then oldest
         bids.sort(key=lambda x: (-x[0]["price"], x[0].get("created_at", 0)))
-        # Asks: lowest price first, then oldest
         asks.sort(key=lambda x: (x[0]["price"], x[0].get("created_at", 0)))
 
         bids_payload = [e for _, e in bids]
@@ -1308,7 +1903,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (global, V1+V2) ----------
+    # ---------- public trades ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1326,7 +1921,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- NEW: public V2-only trades for a contract ----------
+    # ---------- public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
@@ -1349,7 +1944,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Filter only V2 trades for the given contract
         v2_trades = [
             t for t in TRADES
             if t.get("source") == "v2"
@@ -1374,7 +1968,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- V1 take order (creates trades, updates balance) ----------
+    # ---------- V1 take order ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -1418,19 +2012,16 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
-            "source": "v1",  # mark as V1 trade
+            "source": "v1",
         }
         TRADES.append(trade)
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
-
-        # V1 trades are not persisted across restarts
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
 
     def handle_set_collateral(self, username: str):
-        # Admin-only: Authorization: Bearer password123
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             self._send_no_content(401)
@@ -1462,7 +2053,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
-        save_state()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1479,8 +2069,7 @@ class Handler(BaseHTTPRequestHandler):
         potential = self._compute_potential_balance(username)
         collateral = COLLATERAL.get(username)
         if collateral is None:
-            # unlimited collateral – represent as a very large int
-            collateral = 9223372036854775807  # 2^63 - 1
+            collateral = 9223372036854775807
 
         self._send_gbuf(200, {
             "balance": int(balance),
@@ -1488,458 +2077,9 @@ class Handler(BaseHTTPRequestHandler):
             "collateral": int(collateral),
         })
 
-    # ---------- Bulk Operations ----------
-
-    def _get_user_from_token(self, token: str):
-        """Get username from participant token. Returns None if invalid."""
-        if not token:
-            return None
-        return TOKENS.get(token)
-
-    def _execute_create_operation(self, username: str, side: str, price: int, quantity: int,
-                                   delivery_start: int, delivery_end: int, execution_type: str = "GTC"):
-        """Execute a create operation. Returns (success, result_dict, error_code)."""
-        if side not in ("buy", "sell"):
-            return (False, None, 400)
-        if quantity <= 0:
-            return (False, None, 400)
-
-        HOUR_MS = 3600000
-        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
-            return (False, None, 400)
-        if delivery_end <= delivery_start:
-            return (False, None, 400)
-        if delivery_end - delivery_start != HOUR_MS:
-            return (False, None, 400)
-
-        now_ms = int(time.time() * 1000)
-        OPEN_MS = 15 * 24 * 60 * 60 * 1000
-        CLOSE_MS = 60 * 1000
-        open_time = delivery_start - OPEN_MS
-        close_time = delivery_start - CLOSE_MS
-        if now_ms < open_time:
-            return (False, None, 425)
-        if now_ms > close_time:
-            return (False, None, 451)
-
-        # Collateral check
-        if not self._check_collateral_create(username, side, price, quantity):
-            return (False, None, 402)
-
-        order_id = uuid.uuid4().hex
-        remaining = quantity
-        filled_quantity = 0
-
-        # Build candidate list on opposite side
-        if side == "buy":
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status") == "ACTIVE"
-                and o["side"] == "sell"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["price"] <= price
-            ]
-            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status") == "ACTIVE"
-                and o["side"] == "buy"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["price"] >= price
-            ]
-            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
-
-        # Self-match prevention
-        for resting in candidates:
-            if resting.get("owner") == username:
-                return (False, None, 412)
-
-        # FOK: dry-run
-        if execution_type == "FOK":
-            total_possible = 0
-            for resting in candidates:
-                if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
-                    continue
-                total_possible += resting["quantity"]
-                if total_possible >= quantity:
-                    break
-            if total_possible < quantity:
-                return (True, {
-                    "type": "create",
-                    "order_id": order_id,
-                    "status": "CANCELLED",
-                }, None)
-
-        # Matching loop
-        for resting in candidates:
-            if remaining <= 0:
-                break
-            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
-                continue
-
-            trade_qty = min(remaining, resting["quantity"])
-            if trade_qty <= 0:
-                continue
-
-            if side == "buy":
-                buyer_id = username
-                seller_id = resting["owner"]
-            else:
-                buyer_id = resting["owner"]
-                seller_id = username
-
-            trade_price = resting["price"]
-            trade_id = uuid.uuid4().hex
-            ts = int(time.time() * 1000)
-
-            trade = {
-                "trade_id": trade_id,
-                "buyer_id": buyer_id,
-                "seller_id": seller_id,
-                "price": trade_price,
-                "quantity": trade_qty,
-                "timestamp": ts,
-                "delivery_start": delivery_start,
-                "delivery_end": delivery_end,
-                "source": "v2",
-            }
-            TRADES.append(trade)
-            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
-            self._broadcast_trade(trade)
-
-            remaining -= trade_qty
-            filled_quantity += trade_qty
-
-            resting["quantity"] -= trade_qty
-            if resting["quantity"] <= 0:
-                resting["quantity"] = 0
-                resting["status"] = "FILLED"
-
-        # Decide final status
-        if execution_type == "GTC":
-            if remaining > 0:
-                status = "ACTIVE"
-                V2_ORDERS.append({
-                    "order_id": order_id,
-                    "side": side,
-                    "owner": username,
-                    "price": price,
-                    "quantity": remaining,
-                    "delivery_start": delivery_start,
-                    "delivery_end": delivery_end,
-                    "status": "ACTIVE",
-                    "created_at": now_ms,
-                })
-            else:
-                status = "FILLED"
-        elif execution_type == "IOC":
-            status = "FILLED" if remaining <= 0 else "CANCELLED"
-        else:  # FOK
-            status = "FILLED"
-
-        return (True, {
-            "type": "create",
-            "order_id": order_id,
-            "status": status,
-        }, None)
-
-    def _execute_modify_operation(self, username: str, order_id: str, new_price: int, new_quantity: int):
-        """Execute a modify operation. Returns (success, result_dict, error_code)."""
-        if new_quantity <= 0:
-            return (False, None, 400)
-
-        order = None
-        for o in V2_ORDERS:
-            if o.get("order_id") == order_id:
-                order = o
-                break
-
-        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
-            return (False, None, 404)
-
-        if order.get("owner") != username:
-            return (False, None, 403)
-
-        side = order["side"]
-        delivery_start = order["delivery_start"]
-        delivery_end = order["delivery_end"]
-
-        # Self-match prevention
-        if side == "buy":
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status") == "ACTIVE"
-                and o["side"] == "sell"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["order_id"] != order_id
-                and o["price"] <= new_price
-            ]
-            candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:
-            candidates = [
-                o for o in V2_ORDERS
-                if o.get("status") == "ACTIVE"
-                and o["side"] == "buy"
-                and o["delivery_start"] == delivery_start
-                and o["delivery_end"] == delivery_end
-                and o["quantity"] > 0
-                and o["order_id"] != order_id
-                and o["price"] >= new_price
-            ]
-            candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
-
-        for resting in candidates:
-            if resting.get("owner") == username:
-                return (False, None, 412)
-
-        # Collateral check
-        if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
-            return (False, None, 402)
-
-        old_price = order["price"]
-        old_quantity = order["quantity"]
-
-        # Apply modifications
-        order["price"] = new_price
-        order["quantity"] = new_quantity
-
-        now_ms = int(time.time() * 1000)
-        if new_price != old_price or new_quantity > old_quantity:
-            order["created_at"] = now_ms
-
-        remaining = order["quantity"]
-        filled_quantity = 0
-
-        # Matching loop
-        for resting in candidates:
-            if remaining <= 0:
-                break
-            if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
-                continue
-
-            if side == "buy" and new_price < resting["price"]:
-                continue
-            if side == "sell" and new_price > resting["price"]:
-                continue
-
-            trade_qty = min(remaining, resting["quantity"])
-            if trade_qty <= 0:
-                continue
-
-            if side == "buy":
-                buyer_id = username
-                seller_id = resting["owner"]
-            else:
-                buyer_id = resting["owner"]
-                seller_id = username
-
-            trade_price = resting["price"]
-            trade_id = uuid.uuid4().hex
-            ts = int(time.time() * 1000)
-
-            trade = {
-                "trade_id": trade_id,
-                "buyer_id": buyer_id,
-                "seller_id": seller_id,
-                "price": trade_price,
-                "quantity": trade_qty,
-                "timestamp": ts,
-                "delivery_start": delivery_start,
-                "delivery_end": delivery_end,
-                "source": "v2",
-            }
-            TRADES.append(trade)
-            self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
-            self._broadcast_trade(trade)
-
-            remaining -= trade_qty
-            filled_quantity += trade_qty
-            resting["quantity"] -= trade_qty
-            if resting["quantity"] <= 0:
-                resting["quantity"] = 0
-                resting["status"] = "FILLED"
-
-        order["quantity"] = remaining
-        if remaining <= 0:
-            order["quantity"] = 0
-            order["status"] = "FILLED"
-
-        return (True, {
-            "type": "modify",
-            "order_id": order_id,
-        }, None)
-
-    def _execute_cancel_operation(self, username: str, order_id: str):
-        """Execute a cancel operation. Returns (success, result_dict, error_code)."""
-        order = None
-        for o in V2_ORDERS:
-            if o.get("order_id") == order_id:
-                order = o
-                break
-
-        if not order or order.get("status") != "ACTIVE" or order["quantity"] <= 0:
-            return (False, None, 404)
-
-        if order.get("owner") != username:
-            return (False, None, 403)
-
-        order["status"] = "CANCELLED"
-        order["quantity"] = 0
-
-        return (True, {
-            "type": "cancel",
-            "order_id": order_id,
-        }, None)
-
-    def handle_bulk_operations(self):
-        """Handle POST /v2/bulk-operations"""
-        try:
-            raw = self._read_body()
-            data = decode_message(raw)
-        except Exception:
-            self._send_no_content(400)
-            return
-
-        if "contracts" not in data or not isinstance(data["contracts"], list):
-            self._send_no_content(400)
-            return
-
-        results = []
-        all_operations = []
-
-        # First pass: validate structure and collect all operations
-        for contract in data["contracts"]:
-            if not isinstance(contract, dict):
-                self._send_no_content(400)
-                return
-
-            if "delivery_start" not in contract or "delivery_end" not in contract:
-                self._send_no_content(400)
-                return
-
-            try:
-                delivery_start = int(contract["delivery_start"])
-                delivery_end = int(contract["delivery_end"])
-            except Exception:
-                self._send_no_content(400)
-                return
-
-            HOUR_MS = 3600000
-            if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
-                self._send_no_content(400)
-                return
-            if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
-                self._send_no_content(400)
-                return
-
-            if "operations" not in contract or not isinstance(contract["operations"], list):
-                self._send_no_content(400)
-                return
-
-            for op in contract["operations"]:
-                if not isinstance(op, dict):
-                    self._send_no_content(400)
-                    return
-
-                op_type = op.get("type")
-                if op_type not in ("create", "modify", "cancel"):
-                    self._send_no_content(400)
-                    return
-
-                if "participant_token" not in op:
-                    self._send_no_content(400)
-                    return
-
-                # Validate operation-specific fields
-                if op_type == "create":
-                    if "side" not in op or "price" not in op or "quantity" not in op:
-                        self._send_no_content(400)
-                        return
-                elif op_type == "modify":
-                    if "order_id" not in op or "price" not in op or "quantity" not in op:
-                        self._send_no_content(400)
-                        return
-                elif op_type == "cancel":
-                    if "order_id" not in op:
-                        self._send_no_content(400)
-                        return
-
-                all_operations.append((op, delivery_start, delivery_end))
-
-        # Second pass: execute all operations in order
-        for op, delivery_start, delivery_end in all_operations:
-            op_type = op.get("type")
-            participant_token = op.get("participant_token")
-
-            # Get username from token
-            username = self._get_user_from_token(participant_token)
-            if not username:
-                self._send_no_content(401)
-                return
-
-            success = False
-            result = None
-            error_code = None
-
-            if op_type == "create":
-                try:
-                    side = (op.get("side") or "").strip()
-                    price = int(op.get("price"))
-                    quantity = int(op.get("quantity"))
-                    execution_type = (op.get("execution_type") or "GTC").strip() or "GTC"
-                    if execution_type not in ("GTC", "IOC", "FOK"):
-                        self._send_no_content(400)
-                        return
-                except Exception:
-                    self._send_no_content(400)
-                    return
-
-                success, result, error_code = self._execute_create_operation(
-                    username, side, price, quantity, delivery_start, delivery_end, execution_type
-                )
-
-            elif op_type == "modify":
-                try:
-                    order_id = op.get("order_id")
-                    new_price = int(op.get("price"))
-                    new_quantity = int(op.get("quantity"))
-                except Exception:
-                    self._send_no_content(400)
-                    return
-
-                success, result, error_code = self._execute_modify_operation(
-                    username, order_id, new_price, new_quantity
-                )
-
-            elif op_type == "cancel":
-                order_id = op.get("order_id")
-                success, result, error_code = self._execute_cancel_operation(username, order_id)
-
-            if not success:
-                # Operation failed - return appropriate error
-                self.send_response(error_code)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-
-            results.append(result)
-
-        # All operations succeeded - save state and return results
-        save_state()
-
-        self._send_gbuf(200, {"results": results})
-
     # ---------- WebSocket trade stream endpoint ----------
 
     def handle_trades_stream(self):
-        # Basic WebSocket handshake (RFC 6455)
         upgrade = (self.headers.get("Upgrade") or "").lower()
         connection = (self.headers.get("Connection") or "").lower()
         key = self.headers.get("Sec-WebSocket-Key")
@@ -1959,19 +2099,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Sec-WebSocket-Accept", accept)
         self.end_headers()
 
-        # Mark this handler as websocket so finish() doesn't close it
         self._is_websocket = True
-
-        # Store the raw socket for broadcasting
         TRADE_STREAM_CLIENTS.append(self.request)
         # We don't read frames; stream is server -> client only.
-        # When the client disconnects, send will fail and we drop it.
 
 
 def run():
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("", port), Handler)
-    print(f"Server running on port {port}...")
+    server = HTTPServer(("", 8080), Handler)
+    print("Server running on port 8080...")
     server.serve_forever()
 
 
