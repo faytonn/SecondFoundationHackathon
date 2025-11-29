@@ -26,7 +26,7 @@ DNA_SAMPLES = {}
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
 
-# ---------- persistence globals ----------
+# ---------- persistence ----------
 
 PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
 STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json") if PERSISTENT_DIR else None
@@ -66,7 +66,7 @@ def load_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        # If anything goes wrong, start with empty state
+        # Any failure → start with empty state
         return
 
     USERS = data.get("users", {}) or {}
@@ -88,7 +88,7 @@ def save_state():
         "dna_samples": DNA_SAMPLES,
         "collateral": COLLATERAL,
         "v2_orders": V2_ORDERS,
-        # persist only V2 trades; V1 state can reset
+        # Persist only V2 trades; V1 state can reset
         "trades": [t for t in TRADES if t.get("source") == "v2"],
     }
 
@@ -99,7 +99,7 @@ def save_state():
             json.dump(state, f)
         os.replace(tmp_path, STATE_FILE)
     except Exception:
-        # Ignore persistence errors – exchange must still run
+        # Ignore persistence errors – service must still run
         pass
 
 
@@ -1311,7 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades (global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1427,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
-        # V1 trades are not persisted across restarts (V1 state can reset)
+        # V1 trades are not persisted across restarts
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
