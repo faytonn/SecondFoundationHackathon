@@ -60,31 +60,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _compute_potential_balance(self, username: str) -> int:
         """
-        Potential balance = current balance + effect if all ACTIVE orders fill.
+        Potential balance = current balance + effect if all ACTIVE V2 orders fill.
 
-        Includes:
-          - V1 ORDERS (always sells at positive price)
-          - V2_ORDERS (buys/sells with side)
+        V1 orders are ignored for collateral mechanics in this mission.
         """
         balance = BALANCES.get(username, 0)
 
-        # --- V1 orders: always sells made by seller_id ---
-        for o in ORDERS:
-            if not o.get("active", True):
-                continue
-            if o.get("seller_id") != username:
-                continue
-            try:
-                qty = int(o.get("quantity", 0))
-                price = int(o.get("price", 0))
-            except Exception:
-                continue
-            if qty <= 0:
-                continue
-            # V1 is always sell at positive price -> user receives price * qty
-            balance += price * qty
-
-        # --- V2 orders: buys and sells ---
         for o in V2_ORDERS:
             if o.get("owner") != username:
                 continue
@@ -99,11 +80,12 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             side = o.get("side")
+            # Actual economic effect if the order fully executes:
+            # - Buy: user pays price * qty  -> balance -= price * qty
+            # - Sell: user receives price * qty -> balance += price * qty
             if side == "buy":
-                # Buy: user pays price * qty
                 balance -= price * qty
             elif side == "sell":
-                # Sell: user receives price * qty
                 balance += price * qty
 
         return balance
@@ -140,7 +122,6 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # NEW: public V2 trades endpoint
             self.handle_v2_trades(parsed)
 
         else:
@@ -159,7 +140,6 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/trades":
             self.handle_take_order()
         elif self.path == "/v2/bulk-operations":
-            # You can implement this later – for now just not implemented.
             self.send_response(501)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -362,26 +342,42 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- collateral checks ----------
 
     def _check_collateral_create(self, username: str, side: str, price: int, quantity: int) -> bool:
+        """
+        Check whether creating a new V2 order keeps potential_balance >= -collateral.
+        Only orders that can REDUCE balance are checked:
+
+        - Buy with positive price
+        - Sell with negative price
+
+        Orders that would increase balance are always allowed.
+        """
         coll = COLLATERAL.get(username)
         if coll is None:
             return True  # unlimited
-        # Only check orders that can reduce balance
+
+        # Only check orders that can reduce the balance
         if not ((side == "buy" and price > 0) or (side == "sell" and price < 0)):
             return True
+
         base = self._compute_potential_balance(username)
+
         if side == "buy":
-            delta = -price * quantity
-        else:
-            delta = price * quantity
+            delta = -price * quantity  # price > 0 -> negative delta
+        else:  # sell with negative price
+            delta = price * quantity   # price < 0 -> negative delta
+
         potential_after = base + delta
         return potential_after >= -coll
 
     def _check_collateral_modify(self, username: str, order_id: str, new_price: int, new_quantity: int) -> bool:
+        """
+        Recompute potential balance assuming this order has new price/quantity.
+        Same collateral rules as for creation.
+        """
         coll = COLLATERAL.get(username)
         if coll is None:
             return True
 
-        # Recompute potential balance assuming the target order has (new_price, new_quantity)
         base = BALANCES.get(username, 0)
         side_for_target = None
 
@@ -396,10 +392,10 @@ class Handler(BaseHTTPRequestHandler):
             price = int(o["price"])
             side = o["side"]
 
+            # For the order being modified, pretend it has the new values
             if o.get("order_id") == order_id:
                 qty = new_quantity
                 price = new_price
-                side = o["side"]
                 side_for_target = side
 
             if side == "buy":
@@ -411,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
             # Order not found as active – let other logic handle 404
             return True
 
+        # Skip collateral check if the modified order would not reduce balance
         if not ((side_for_target == "buy" and new_price > 0) or (side_for_target == "sell" and new_price < 0)):
             return True
 
@@ -484,7 +481,6 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] <= price
             ]
-            # Cheapest sells first, then oldest
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
         else:  # sell
             candidates = [
@@ -496,7 +492,6 @@ class Handler(BaseHTTPRequestHandler):
                 and o["quantity"] > 0
                 and o["price"] >= price
             ]
-            # Highest bids first, then oldest
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
         # Self-match prevention BEFORE any trades / book changes
@@ -537,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -620,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         delivery_start = order["delivery_start"]
         delivery_end = order["delivery_end"]
 
-        # Self-match prevention: compute candidates with new price BEFORE mutating order
+        # Self-match prevention with new price BEFORE mutating order
         if side == "buy":
             candidates = [
                 o for o in V2_ORDERS
@@ -708,7 +703,7 @@ class Handler(BaseHTTPRequestHandler):
                 "timestamp": ts,
                 "delivery_start": delivery_start,
                 "delivery_end": delivery_end,
-                "source": "v2",  # mark as V2 trade
+                "source": "v2",
             }
             TRADES.append(trade)
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
@@ -897,7 +892,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (unchanged: global, V1+V2) ----------
+    # ---------- public trades (global V1+V2 feed) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -915,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- NEW: public V2-only trades for a contract ----------
+    # ---------- public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
@@ -938,7 +933,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        # Filter only V2 trades for the given contract
         v2_trades = [
             t for t in TRADES
             if t.get("source") == "v2"
@@ -1007,7 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
             "timestamp": now_ms,
             "delivery_start": int(order["delivery_start"]),
             "delivery_end": int(order["delivery_end"]),
-            "source": "v1",  # mark as V1 trade
+            "source": "v1",
         }
         TRADES.append(trade)
 
@@ -1064,6 +1058,7 @@ class Handler(BaseHTTPRequestHandler):
 
         balance = BALANCES.get(username, 0)
         potential = self._compute_potential_balance(username)
+
         collateral = COLLATERAL.get(username)
         if collateral is None:
             # unlimited collateral – represent as a very large int
