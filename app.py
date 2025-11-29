@@ -19,6 +19,10 @@ TOKENS = {}   # token -> username
 # }
 ORDERS = []
 
+
+V2_ORDERS = []
+
+
 # Each trade:
 # {
 #   "trade_id": str,
@@ -91,12 +95,17 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/login":
             self.handle_login()
         elif self.path == "/orders":
+            # V1 submit order
             self.handle_submit_order()
+        elif self.path == "/v2/orders":
+            # V2 submit order (buy/sell)
+            self.handle_submit_order_v2()
         elif self.path == "/trades":
             self.handle_take_order()
         else:
             self.send_response(404)
             self.end_headers()
+
 
 
     # -- forgot password --
@@ -305,6 +314,72 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"order_id": order_id})
 
+
+
+    def handle_submit_order_v2(self):
+        # Requires authentication
+        username = self._get_authenticated_user()
+        if not username:
+            self._send_no_content(401)
+            return
+
+        try:
+            raw = self._read_body()
+            data = decode_message(raw)
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        # Required fields
+        side = (data.get("side") or "").strip()
+        try:
+            price = int(data.get("price"))
+            quantity = int(data.get("quantity"))
+            delivery_start = int(data.get("delivery_start"))
+            delivery_end = int(data.get("delivery_end"))
+        except Exception:
+            self._send_no_content(400)
+            return
+
+        # side must be "buy" or "sell"
+        if side not in ("buy", "sell"):
+            self._send_no_content(400)
+            return
+
+        # quantity must be positive
+        if quantity <= 0:
+            self._send_no_content(400)
+            return
+
+        # delivery times aligned to 1-hour boundaries and exactly 1 hour apart
+        HOUR_MS = 3600000
+        if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
+            self._send_no_content(400)
+            return
+        if delivery_end <= delivery_start:
+            self._send_no_content(400)
+            return
+        if delivery_end - delivery_start != HOUR_MS:
+            self._send_no_content(400)
+            return
+
+        # Create V2 order (separate from V1 ORDERS)
+        order_id = uuid.uuid4().hex
+        order = {
+            "order_id": order_id,
+            "side": side,
+            "owner": username,
+            "price": price,
+            "quantity": quantity,
+            "delivery_start": delivery_start,
+            "delivery_end": delivery_end,
+            "active": True,
+        }
+        V2_ORDERS.append(order)
+
+        # Response: order_id
+        self._send_gbuf(200, {"order_id": order_id})
+
     # ---------- /trades (GET) ----------
 
     def handle_list_trades(self):
@@ -331,7 +406,6 @@ class Handler(BaseHTTPRequestHandler):
         # Requires authentication
         username = self._get_authenticated_user()
         if not username:
-            # 401 Unauthorized – no valid token
             self._send_no_content(401)
             return
 
@@ -339,17 +413,15 @@ class Handler(BaseHTTPRequestHandler):
             raw = self._read_body()
             data = decode_message(raw)
         except Exception:
-            # Bad GalacticBuf → treat as bad request
             self._send_no_content(400)
             return
 
         order_id = (data.get("order_id") or "").strip()
         if not order_id:
-            # 400 Bad Request – order_id missing/empty
             self._send_no_content(400)
             return
 
-        # Find active order by id
+        # Find active order
         order = None
         for o in ORDERS:
             if o.get("order_id") == order_id and o.get("active", True):
@@ -357,15 +429,14 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
         if not order:
-            # 404 Not Found – order doesn't exist or not active
             self._send_no_content(404)
             return
 
-        # Mark order as FILLED / inactive
+        # ↓ REQUIRED BY SPEC: mark FILLED and remove from active list
         order["active"] = False
+        ORDERS.remove(order)
 
-        # Create trade record
-        import time
+        # Create trade
         trade_id = uuid.uuid4().hex
         now_ms = int(time.time() * 1000)
 
@@ -379,7 +450,6 @@ class Handler(BaseHTTPRequestHandler):
         }
         TRADES.append(trade)
 
-        # 200 OK with GalacticBuf { trade_id }
         self._send_gbuf(200, {"trade_id": trade_id})
 
 
