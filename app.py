@@ -3,16 +3,6 @@ from urllib.parse import urlparse, parse_qs
 from galacticbuffer import encode_message, decode_message
 import uuid
 import time
-import os
-import json
-
-# ---------- persistence config ----------
-
-PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
-STATE_FILE = None
-if PERSISTENT_DIR:
-    os.makedirs(PERSISTENT_DIR, exist_ok=True)
-    STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json")
 
 USERS = {}
 TOKENS = {}
@@ -24,54 +14,6 @@ TRADES = []
 # New: balances + collateral
 BALANCES = {}     # username -> int
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
-
-
-def _load_persistent_state():
-    """
-    Load USERS, BALANCES, COLLATERAL, TRADES from STATE_FILE.
-    V2_ORDERS and ORDERS are intentionally NOT loaded -> order book resets.
-    """
-    global USERS, TRADES, BALANCES, COLLATERAL
-
-    if not STATE_FILE or not os.path.exists(STATE_FILE):
-        return
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        # If anything goes wrong, start with empty state
-        return
-
-    USERS = data.get("USERS", {}) or {}
-    BALANCES = data.get("BALANCES", {}) or {}
-    COLLATERAL = data.get("COLLATERAL", {}) or {}
-    TRADES = data.get("TRADES", []) or []
-
-
-def _save_persistent_state():
-    """
-    Save USERS, BALANCES, COLLATERAL, TRADES to STATE_FILE.
-    Does NOT save ORDERS/V2_ORDERS -> they reset on restart.
-    """
-    if not STATE_FILE:
-        return
-
-    data = {
-        "USERS": USERS,
-        "BALANCES": BALANCES,
-        "COLLATERAL": COLLATERAL,
-        "TRADES": TRADES,
-    }
-
-    tmp_path = STATE_FILE + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp_path, STATE_FILE)
-    except Exception:
-        # Persistence is best-effort; ignore failures here
-        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -104,9 +46,6 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         return TOKENS.get(token)
-
-    def _persist(self):
-        _save_persistent_state()
 
     # ----- balances / collateral helpers -----
 
@@ -201,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_get_balance()
 
         elif parsed.path == "/v2/trades":
-            # public V2 trades endpoint
+            # NEW: public V2 trades endpoint
             self.handle_v2_trades(parsed)
 
         else:
@@ -270,12 +209,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         USERS[username] = password
-        self._persist()
         self._send_no_content(204)
 
     def handle_login(self):
         try:
-            raw = self._read_body()  # fixed: __read_body -> _read_body
+            raw = self._read_body()
             data = decode_message(raw)
         except Exception:
             self._send_no_content(401)
@@ -331,7 +269,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(500)
             return
 
-        self._persist()
         self._send_no_content(204)
 
     # ---------- V1 orders & trades ----------
@@ -626,7 +563,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status = "FILLED"
 
-        self._persist()
         self._send_gbuf(200, {
             "order_id": order_id,
             "status": status,
@@ -786,7 +722,6 @@ class Handler(BaseHTTPRequestHandler):
             order["quantity"] = 0
             order["status"] = "FILLED"
 
-        self._persist()
         self._send_gbuf(200, {
             "order_id": order["order_id"],
             "status": order["status"],
@@ -977,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- public V2-only trades for a contract ----------
+    # ---------- NEW: public V2-only trades for a contract ----------
 
     def handle_v2_trades(self, parsed):
         qs = parse_qs(parsed.query)
@@ -1075,7 +1010,6 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
-        self._persist()
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
@@ -1113,7 +1047,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         COLLATERAL[username] = collateral_value
-        self._persist()
         self._send_no_content(204)
 
     def handle_get_balance(self):
@@ -1144,24 +1077,6 @@ class Handler(BaseHTTPRequestHandler):
     def handle_bulk_operations(self):
         """
         POST /v2/bulk-operations
-
-        Body (galacticbuf):
-        {
-          "contracts": [
-            {
-              "delivery_start": int,
-              "delivery_end": int,
-              "operations": [
-                {
-                  "type": "create" | "modify" | "cancel",
-                  "participant_token": "....",
-                  ...
-                }
-              ]
-            },
-            ...
-          ]
-        }
         """
         try:
             raw = self._read_body()
@@ -1175,8 +1090,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_no_content(400)
             return
 
-        results = []
         HOUR_MS = 3600000
+        results = []
 
         for contract in contracts:
             try:
@@ -1186,7 +1101,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(400)
                 return
 
-            # Same contract validation as for V2 orders
+            # Same validation as normal V2 orders
             if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
                 self._send_no_content(400)
                 return
@@ -1199,13 +1114,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_no_content(400)
                 return
 
-            # Process operations in order
             for op in ops:
                 op_type = (op.get("type") or "").strip()
                 participant_token = (op.get("participant_token") or "").strip()
-
                 if not op_type or not participant_token:
-                    # Missing auth token for operation -> whole request fails
                     self._send_no_content(401)
                     return
 
@@ -1214,7 +1126,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_no_content(401)
                     return
 
-                # CREATE
                 if op_type == "create":
                     side = (op.get("side") or "").strip()
                     try:
@@ -1225,8 +1136,12 @@ class Handler(BaseHTTPRequestHandler):
                         return
 
                     status, res = self._bulk_v2_create(
-                        username, side, price, quantity,
-                        delivery_start, delivery_end
+                        username=username,
+                        side=side,
+                        price=price,
+                        quantity=quantity,
+                        delivery_start=delivery_start,
+                        delivery_end=delivery_end,
                     )
                     if status != 200:
                         self._send_no_content(status)
@@ -1238,7 +1153,6 @@ class Handler(BaseHTTPRequestHandler):
                         "status": res["status"],
                     })
 
-                # MODIFY
                 elif op_type == "modify":
                     order_id = (op.get("order_id") or "").strip()
                     if not order_id:
@@ -1252,7 +1166,10 @@ class Handler(BaseHTTPRequestHandler):
                         return
 
                     status, res = self._bulk_v2_modify(
-                        username, order_id, new_price, new_quantity
+                        username=username,
+                        order_id=order_id,
+                        new_price=new_price,
+                        new_quantity=new_quantity,
                     )
                     if status != 200:
                         self._send_no_content(status)
@@ -1263,14 +1180,16 @@ class Handler(BaseHTTPRequestHandler):
                         "order_id": res["order_id"],
                     })
 
-                # CANCEL
                 elif op_type == "cancel":
                     order_id = (op.get("order_id") or "").strip()
                     if not order_id:
                         self._send_no_content(400)
                         return
 
-                    status, res = self._bulk_v2_cancel(username, order_id)
+                    status, res = self._bulk_v2_cancel(
+                        username=username,
+                        order_id=order_id,
+                    )
                     if status != 200:
                         self._send_no_content(status)
                         return
@@ -1281,34 +1200,28 @@ class Handler(BaseHTTPRequestHandler):
                     })
 
                 else:
-                    # Unknown operation type
                     self._send_no_content(400)
                     return
 
-        # If we got here, all operations succeeded
-        self._persist()
         self._send_gbuf(200, {"results": results})
 
-    # --------- INTERNAL HELPERS FOR BULK OPS ---------
-
     def _bulk_v2_create(self, username: str, side: str, price: int, quantity: int,
-                        delivery_start: int, delivery_end: int):
+                         delivery_start: int, delivery_end: int):
         """
         Internal create for bulk-operations.
         Returns (status_code, result_dict_or_None).
         """
+        HOUR_MS = 3600000
+
         if side not in ("buy", "sell"):
             return 400, None
         if quantity <= 0:
             return 400, None
-
-        HOUR_MS = 3600000
         if (delivery_start % HOUR_MS) != 0 or (delivery_end % HOUR_MS) != 0:
             return 400, None
         if delivery_end <= delivery_start or delivery_end - delivery_start != HOUR_MS:
             return 400, None
 
-        # Collateral check BEFORE matching/adding order
         if not self._check_collateral_create(username, side, price, quantity):
             return 402, None
 
@@ -1316,7 +1229,6 @@ class Handler(BaseHTTPRequestHandler):
         now_ms = int(time.time() * 1000)
 
         remaining = quantity
-        filled_quantity = 0
 
         # Build candidate list on opposite side
         if side == "buy":
@@ -1330,7 +1242,7 @@ class Handler(BaseHTTPRequestHandler):
                 and o["price"] <= price
             ]
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
+        else:
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -1342,7 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
             candidates.sort(key=lambda o: (-o["price"], o.get("created_at", 0)))
 
-        # Self-match prevention BEFORE any trades / book changes
+        # Self-match prevention
         for resting in candidates:
             if resting.get("owner") == username:
                 return 412, None
@@ -1351,7 +1263,6 @@ class Handler(BaseHTTPRequestHandler):
         for resting in candidates:
             if remaining <= 0:
                 break
-
             if resting.get("status") != "ACTIVE" or resting["quantity"] <= 0:
                 continue
 
@@ -1385,8 +1296,6 @@ class Handler(BaseHTTPRequestHandler):
             self._apply_trade_balances(buyer_id, seller_id, trade_price, trade_qty)
 
             remaining -= trade_qty
-            filled_quantity += trade_qty
-
             resting["quantity"] -= trade_qty
             if resting["quantity"] <= 0:
                 resting["quantity"] = 0
@@ -1408,13 +1317,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status = "FILLED"
 
-        return 200, {
-            "order_id": order_id,
-            "status": status,
-        }
+        return 200, {"order_id": order_id, "status": status}
 
     def _bulk_v2_modify(self, username: str, order_id: str,
-                        new_price: int, new_quantity: int):
+                         new_price: int, new_quantity: int):
         """
         Internal modify for bulk-operations.
         Returns (status_code, result_dict_or_None).
@@ -1451,7 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
                 and o["price"] <= new_price
             ]
             candidates.sort(key=lambda o: (o["price"], o.get("created_at", 0)))
-        else:  # sell
+        else:
             candidates = [
                 o for o in V2_ORDERS
                 if o.get("status") == "ACTIVE"
@@ -1468,14 +1374,12 @@ class Handler(BaseHTTPRequestHandler):
             if resting.get("owner") == username:
                 return 412, None
 
-        # Collateral check with new values
         if not self._check_collateral_modify(username, order_id, new_price, new_quantity):
             return 402, None
 
         old_price = order["price"]
         old_quantity = order["quantity"]
 
-        # Apply modifications
         order["price"] = new_price
         order["quantity"] = new_quantity
 
@@ -1485,7 +1389,6 @@ class Handler(BaseHTTPRequestHandler):
 
         remaining = order["quantity"]
 
-        # Matching loop using precomputed candidates
         for resting in candidates:
             if remaining <= 0:
                 break
@@ -1537,9 +1440,7 @@ class Handler(BaseHTTPRequestHandler):
             order["quantity"] = 0
             order["status"] = "FILLED"
 
-        return 200, {
-            "order_id": order["order_id"],
-        }
+        return 200, {"order_id": order["order_id"]}
 
     def _bulk_v2_cancel(self, username: str, order_id: str):
         """
@@ -1560,14 +1461,10 @@ class Handler(BaseHTTPRequestHandler):
 
         order["status"] = "CANCELLED"
         order["quantity"] = 0
-
-        return 200, {
-            "order_id": order_id,
-        }
+        return 200, {"order_id": order_id}
 
 
 def run():
-    _load_persistent_state()
     server = HTTPServer(("", 8080), Handler)
     print("Server running on port 8080...")
     server.serve_forever()
