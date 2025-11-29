@@ -11,24 +11,22 @@ import json
 USERS = {}
 TOKENS = {}
 
-ORDERS = []      # V1 orders (in-memory only, does NOT persist)
-V2_ORDERS = []   # V2 orders (persisted)
-TRADES = []      # All trades in-memory; only V2 trades are persisted
+ORDERS = []
+V2_ORDERS = []
+TRADES = []
 
-# balances are derived from V2 trades (recomputed on startup from persisted trades)
+# New: balances + collateral
 BALANCES = {}     # username -> int
-
-# collateral limits (persisted)
 COLLATERAL = {}   # username -> collateral limit (None = unlimited)
 
-# DNA samples (persisted)
+# New: DNA samples
 # username -> list of registered DNA strings
 DNA_SAMPLES = {}
 
 # WebSocket trade stream clients (raw sockets)
 TRADE_STREAM_CLIENTS = []
 
-# ---------- persistence setup ----------
+# ---------- persistence globals ----------
 
 PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR")
 STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json") if PERSISTENT_DIR else None
@@ -37,7 +35,7 @@ STATE_FILE = os.path.join(PERSISTENT_DIR, "state.json") if PERSISTENT_DIR else N
 def _rebuild_balances_from_trades():
     """
     Recompute BALANCES only from V2 trades.
-    V1 trades are not persisted, so they don't affect balances after restart.
+    V1 state does not persist across restarts.
     """
     global BALANCES
     BALANCES = {}
@@ -57,7 +55,7 @@ def _rebuild_balances_from_trades():
 
 
 def load_state():
-    global USERS, DNA_SAMPLES, COLLATERAL, V2_ORDERS, TRADES
+    global USERS, V2_ORDERS, TRADES, DNA_SAMPLES, COLLATERAL
 
     if not STATE_FILE:
         return
@@ -74,12 +72,10 @@ def load_state():
     USERS = data.get("users", {}) or {}
     DNA_SAMPLES = data.get("dna_samples", {}) or {}
     COLLATERAL = data.get("collateral", {}) or {}
-    V2_ORDERS[:] = data.get("v2_orders", []) or []
 
-    # Persisted trades: only V2 trades were stored
+    V2_ORDERS[:] = data.get("v2_orders", []) or []
     TRADES[:] = data.get("trades", []) or []
 
-    # Rebuild balances from persisted V2 trades
     _rebuild_balances_from_trades()
 
 
@@ -87,13 +83,12 @@ def save_state():
     if not STATE_FILE:
         return
 
-    # Only persist essential state
     state = {
         "users": USERS,
         "dna_samples": DNA_SAMPLES,
         "collateral": COLLATERAL,
         "v2_orders": V2_ORDERS,
-        # Only V2 trades need to persist; V1 state can reset
+        # persist only V2 trades; V1 state can reset
         "trades": [t for t in TRADES if t.get("source") == "v2"],
     }
 
@@ -104,11 +99,11 @@ def save_state():
             json.dump(state, f)
         os.replace(tmp_path, STATE_FILE)
     except Exception:
-        # On failure, just ignore; app must still run
+        # Ignore persistence errors – exchange must still run
         pass
 
 
-# Load persisted state at startup
+# Load persisted state on startup
 load_state()
 
 
@@ -638,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"token": token})
 
-    # ---------- V1 orders & trades (NOT persisted) ----------
+    # ---------- V1 orders & trades (non-persistent) ----------
 
     def handle_list_orders(self, parsed):
         qs = parse_qs(parsed.query)
@@ -968,7 +963,6 @@ class Handler(BaseHTTPRequestHandler):
             # so remaining should be 0 here.
             status = "FILLED"
 
-        # Persist V2 state + V2 trades
         save_state()
 
         self._send_gbuf(200, {
@@ -1317,7 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": my_trades})
 
-    # ---------- public trades (global, V1+V2 in-memory) ----------
+    # ---------- public trades (unchanged: global, V1+V2) ----------
 
     def handle_list_trades(self):
         trades_sorted = sorted(TRADES, key=lambda t: int(t["timestamp"]), reverse=True)
@@ -1383,7 +1377,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_gbuf(200, {"trades": trades_payload})
 
-    # ---------- V1 take order (creates trades, updates balance, NOT persisted) ----------
+    # ---------- V1 take order (creates trades, updates balance) ----------
 
     def handle_take_order(self):
         username = self._get_authenticated_user()
@@ -1433,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._apply_trade_balances(username, order["seller_id"], int(order["price"]), int(order["quantity"]))
 
-        # V1 trades are not persisted across restarts
+        # V1 trades are not persisted across restarts (V1 state can reset)
         self._send_gbuf(200, {"trade_id": trade_id})
 
     # ---------- collateral endpoints ----------
